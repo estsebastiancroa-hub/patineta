@@ -1,0 +1,2595 @@
+# Patineta - compila la app de Android y publica el APK para descargar.
+# Este archivo contiene TODO el código de la app: GitHub lo arma y genera el APK.
+name: Construir APK de Patineta
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Crear el proyecto de la app
+        run: |
+          mkdir -p app
+          cat > app/build.gradle <<'EOF_PATINETA'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.sebastian.patineta'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.sebastian.patineta'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 3
+                  versionName '1.2'
+              }
+
+              signingConfigs {
+                  debug {
+                      storeFile file('debug.keystore')
+                      storePassword 'android'
+                      keyAlias 'androiddebugkey'
+                      keyPassword 'android'
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          EOF_PATINETA
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_PATINETA'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <uses-feature android:name="android.hardware.location.gps" android:required="false" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="Patineta"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".MapaActivity"
+                      android:exported="false" />
+
+                  <service
+                      android:name=".TrackService"
+                      android:exported="false"
+                      android:foregroundServiceType="location" />
+              </application>
+          </manifest>
+          EOF_PATINETA
+          mkdir -p app/src/main/java/com/sebastian/patineta
+          cat > app/src/main/java/com/sebastian/patineta/Datos.java <<'EOF_PATINETA'
+          package com.sebastian.patineta;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+
+          import org.json.JSONArray;
+          import org.json.JSONException;
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileReader;
+          import java.io.FileWriter;
+          import java.io.IOException;
+          import java.text.NumberFormat;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Calendar;
+          import java.util.Date;
+          import java.util.List;
+          import java.util.Locale;
+
+          /** Datos de la app (recorridos, anotaciones y avisos) + utilidades de formato. */
+          public class Datos {
+              public static final Locale ES = new Locale("es", "CO");
+              private static final String PREFS = "patineta";
+
+              public static final String[] TIPOS = {"Mantenimiento", "Reparación", "Cambio de pieza", "Compra", "Accesorio", "Otro"};
+
+              // ---------------------------------------------------------------- Modelos
+              public abstract static class Item {
+                  public long id;
+                  abstract JSONObject toJson() throws JSONException;
+              }
+
+              /** Un recorrido (con GPS o escrito a mano). */
+              public static class Ride extends Item {
+                  public long start;
+                  public long durMs;
+                  public double km;
+                  public boolean manual;
+
+                  JSONObject toJson() throws JSONException {
+                      JSONObject o = new JSONObject();
+                      o.put("id", id);
+                      o.put("start", start);
+                      o.put("durMs", durMs);
+                      o.put("km", km);
+                      o.put("manual", manual);
+                      return o;
+                  }
+
+                  static Ride fromJson(JSONObject o) {
+                      Ride r = new Ride();
+                      r.id = o.optLong("id");
+                      r.start = o.optLong("start");
+                      r.durMs = o.optLong("durMs");
+                      r.km = o.optDouble("km", 0);
+                      r.manual = o.optBoolean("manual", false);
+                      return r;
+                  }
+              }
+
+              /** Una anotación de la bitácora (reparación, cambio, compra...). */
+              public static class Entry extends Item {
+                  public long date;
+                  public int tipo;
+                  public String titulo = "";
+                  public String notas = "";
+                  public double costo;
+                  public double km;
+
+                  JSONObject toJson() throws JSONException {
+                      JSONObject o = new JSONObject();
+                      o.put("id", id);
+                      o.put("date", date);
+                      o.put("tipo", tipo);
+                      o.put("titulo", titulo);
+                      o.put("notas", notas);
+                      o.put("costo", costo);
+                      o.put("km", km);
+                      return o;
+                  }
+
+                  static Entry fromJson(JSONObject o) {
+                      Entry e = new Entry();
+                      e.id = o.optLong("id");
+                      e.date = o.optLong("date");
+                      e.tipo = o.optInt("tipo", 0);
+                      if (e.tipo < 0 || e.tipo >= TIPOS.length) e.tipo = TIPOS.length - 1;
+                      e.titulo = o.optString("titulo", "");
+                      e.notas = o.optString("notas", "");
+                      e.costo = o.optDouble("costo", 0);
+                      e.km = o.optDouble("km", 0);
+                      return e;
+                  }
+              }
+
+              /** Un aviso por km: "Frenos cada 300 km". */
+              public static class Aviso extends Item {
+                  public String nombre = "";
+                  public double cadaKm;
+                  public double ultimoKm;   // km de la patineta cuando se hizo por última vez
+                  public int notificado;    // 0 nada, 1 "pronto", 2 "toca"
+
+                  JSONObject toJson() throws JSONException {
+                      JSONObject o = new JSONObject();
+                      o.put("id", id);
+                      o.put("nombre", nombre);
+                      o.put("cadaKm", cadaKm);
+                      o.put("ultimoKm", ultimoKm);
+                      o.put("notificado", notificado);
+                      return o;
+                  }
+
+                  static Aviso fromJson(JSONObject o) {
+                      Aviso a = new Aviso();
+                      a.id = o.optLong("id");
+                      a.nombre = o.optString("nombre", "");
+                      a.cadaKm = o.optDouble("cadaKm", 0);
+                      a.ultimoKm = o.optDouble("ultimoKm", 0);
+                      a.notificado = o.optInt("notificado", 0);
+                      return a;
+                  }
+              }
+
+              /** 0 = al día, 1 = pronto (falta menos del 10 %), 2 = ya toca. */
+              public static int nivel(Aviso a, double odo) {
+                  double falta = a.ultimoKm + a.cadaKm - odo;
+                  if (falta <= 0) return 2;
+                  if (falta <= a.cadaKm * 0.1) return 1;
+                  return 0;
+              }
+
+              public static double falta(Aviso a, double odo) {
+                  return a.ultimoKm + a.cadaKm - odo;
+              }
+
+              // ------------------------------------------------------------ Almacenamiento
+              private interface Maker<T> {
+                  T make(JSONObject o);
+              }
+
+              private static SharedPreferences p(Context c) {
+                  return c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+              }
+
+              private static <T extends Item> List<T> load(Context c, String key, Maker<T> m) {
+                  List<T> list = new ArrayList<>();
+                  try {
+                      JSONArray a = new JSONArray(p(c).getString(key, "[]"));
+                      for (int i = 0; i < a.length(); i++) list.add(m.make(a.getJSONObject(i)));
+                  } catch (JSONException ignored) { }
+                  return list;
+              }
+
+              private static <T extends Item> void save(Context c, String key, List<T> list) {
+                  JSONArray a = new JSONArray();
+                  try {
+                      for (T t : list) a.put(t.toJson());
+                  } catch (JSONException ignored) { }
+                  p(c).edit().putString(key, a.toString()).apply();
+              }
+
+              private static <T extends Item> void upsert(List<T> list, T x) {
+                  for (int i = 0; i < list.size(); i++) {
+                      if (list.get(i).id == x.id) {
+                          list.set(i, x);
+                          return;
+                      }
+                  }
+                  list.add(x);
+              }
+
+              private static void removeId(List<? extends Item> list, long id) {
+                  for (int i = 0; i < list.size(); i++) {
+                      if (list.get(i).id == id) {
+                          list.remove(i);
+                          return;
+                      }
+                  }
+              }
+
+              public static List<Ride> loadRides(Context c) { return load(c, "rides", Ride::fromJson); }
+
+              public static void upsertRide(Context c, Ride r) {
+                  List<Ride> l = loadRides(c);
+                  upsert(l, r);
+                  save(c, "rides", l);
+              }
+
+              public static void deleteRide(Context c, long id) {
+                  List<Ride> l = loadRides(c);
+                  removeId(l, id);
+                  save(c, "rides", l);
+                  rutaFile(c, id).delete();
+              }
+
+              // ------------------------------------------------------------------ Rutas (mapa)
+              /** Ruta del recorrido en curso. */
+              public static File rutaActual(Context c) {
+                  return new File(c.getFilesDir(), "ruta_actual.txt");
+              }
+
+              /** Ruta guardada de un recorrido terminado. */
+              public static File rutaFile(Context c, long rideId) {
+                  return new File(c.getFilesDir(), "ruta_" + rideId + ".txt");
+              }
+
+              /** La ruta que haces todos los días (guardada para usarla sin internet). */
+              public static File rutaDiaria(Context c) {
+                  return new File(c.getFilesDir(), "ruta_diaria.txt");
+              }
+
+              public static void copiar(File from, File to) {
+                  try (java.io.FileInputStream in = new java.io.FileInputStream(from);
+                       java.io.FileOutputStream out = new java.io.FileOutputStream(to)) {
+                      byte[] buf = new byte[8192];
+                      int n;
+                      while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                  } catch (IOException ignored) { }
+              }
+
+              /** Agrega una línea a la ruta: "S" = tramo nuevo, o "lat,lon". */
+              public static void rutaAppend(File f, String line) {
+                  try (FileWriter w = new FileWriter(f, true)) {
+                      w.write(line + "\n");
+                  } catch (IOException ignored) { }
+              }
+
+              /** Lee la ruta y la devuelve como JSON: [[[lat,lon],...],[...]] (un arreglo por tramo). */
+              public static String rutaJson(File f) {
+                  List<List<String>> segs = new ArrayList<>();
+                  if (f.exists()) {
+                      try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+                          String s;
+                          while ((s = r.readLine()) != null) {
+                              s = s.trim();
+                              if (s.isEmpty()) continue;
+                              if (s.equals("S")) {
+                                  segs.add(new ArrayList<String>());
+                              } else if (s.indexOf(',') > 0) {
+                                  if (segs.isEmpty()) segs.add(new ArrayList<String>());
+                                  segs.get(segs.size() - 1).add(s);
+                              }
+                          }
+                      } catch (IOException ignored) { }
+                  }
+                  int total = 0;
+                  for (List<String> g : segs) total += g.size();
+                  int paso = Math.max(1, total / 3000); // si hay demasiados puntos, deja uno de cada "paso"
+                  StringBuilder sb = new StringBuilder("[");
+                  boolean firstSeg = true;
+                  for (List<String> g : segs) {
+                      if (g.isEmpty()) continue;
+                      if (!firstSeg) sb.append(',');
+                      firstSeg = false;
+                      sb.append('[');
+                      for (int i = 0; i < g.size(); i++) {
+                          if (i % paso != 0 && i != g.size() - 1) continue;
+                          if (sb.charAt(sb.length() - 1) != '[') sb.append(',');
+                          sb.append('[').append(g.get(i)).append(']');
+                      }
+                      sb.append(']');
+                  }
+                  return sb.append(']').toString();
+              }
+
+              public static List<Entry> loadEntries(Context c) { return load(c, "entries", Entry::fromJson); }
+
+              public static void upsertEntry(Context c, Entry e) {
+                  List<Entry> l = loadEntries(c);
+                  upsert(l, e);
+                  save(c, "entries", l);
+              }
+
+              public static void deleteEntry(Context c, long id) {
+                  List<Entry> l = loadEntries(c);
+                  removeId(l, id);
+                  save(c, "entries", l);
+              }
+
+              public static List<Aviso> loadAvisos(Context c) { return load(c, "avisos", Aviso::fromJson); }
+
+              public static void upsertAviso(Context c, Aviso a) {
+                  List<Aviso> l = loadAvisos(c);
+                  upsert(l, a);
+                  save(c, "avisos", l);
+              }
+
+              public static void deleteAviso(Context c, long id) {
+                  List<Aviso> l = loadAvisos(c);
+                  removeId(l, id);
+                  save(c, "avisos", l);
+              }
+
+              public static void saveAvisos(Context c, List<Aviso> l) { save(c, "avisos", l); }
+
+              /** Km que ya tenía la patineta antes de empezar a usar la app. */
+              public static double baseKm(Context c) {
+                  try {
+                      return Double.parseDouble(p(c).getString("baseKm", "0"));
+                  } catch (NumberFormatException e) {
+                      return 0;
+                  }
+              }
+
+              public static void setBaseKm(Context c, double v) {
+                  p(c).edit().putString("baseKm", Double.toString(v)).apply();
+              }
+
+              /** Km totales de la patineta = km iniciales + todos los recorridos guardados. */
+              public static double odometer(Context c) {
+                  double t = baseKm(c);
+                  for (Ride r : loadRides(c)) t += r.km;
+                  return t;
+              }
+
+              // ------------------------------------------------------------------ Formato
+              public static String km1(double v) {
+                  return String.format(ES, "%,.1f", v);
+              }
+
+              public static String km2(double v) {
+                  return String.format(ES, "%,.2f", v);
+              }
+
+              /** Número para mostrar dentro de un campo de texto (sin separador de miles). */
+              public static String campo(double v) {
+                  String s = String.format(Locale.US, "%.2f", v);
+                  if (s.endsWith(".00")) s = s.substring(0, s.length() - 3);
+                  else if (s.endsWith("0")) s = s.substring(0, s.length() - 1);
+                  return s;
+              }
+
+              public static String money(double v) {
+                  return "$ " + NumberFormat.getIntegerInstance(ES).format(Math.round(v));
+              }
+
+              /** Cronómetro: 12:05 o 1:02:33. */
+              public static String clock(long ms) {
+                  long s = ms / 1000;
+                  long h = s / 3600, m = (s % 3600) / 60, sec = s % 60;
+                  if (h > 0) return String.format(ES, "%d:%02d:%02d", h, m, sec);
+                  return String.format(ES, "%02d:%02d", m, sec);
+              }
+
+              /** Duración corta: 42 min o 1 h 05 min. */
+              public static String dur(long ms) {
+                  long min = Math.round(ms / 60000.0);
+                  if (min < 60) return min + " min";
+                  return (min / 60) + " h " + String.format(ES, "%02d", min % 60) + " min";
+              }
+
+              public static String fechaHora(long ms) {
+                  return new SimpleDateFormat("EEE d MMM · h:mm a", ES).format(new Date(ms));
+              }
+
+              public static String fecha(long ms) {
+                  return new SimpleDateFormat("d MMM yyyy", ES).format(new Date(ms));
+              }
+
+              public static String fechaLarga(long ms) {
+                  return new SimpleDateFormat("EEE d 'de' MMMM yyyy", ES).format(new Date(ms));
+              }
+
+              public static String hoy() {
+                  return new SimpleDateFormat("EEEE d 'de' MMMM", ES).format(new Date()).toUpperCase(ES);
+              }
+
+              /** Lee un número que puede venir con coma o punto decimal. */
+              public static double num(String s) {
+                  if (s == null) return 0;
+                  s = s.trim();
+                  if (s.isEmpty()) return 0;
+                  if (s.contains(",")) s = s.replace(".", "").replace(",", ".");
+                  try {
+                      double v = Double.parseDouble(s);
+                      return (Double.isNaN(v) || Double.isInfinite(v) || v < 0) ? 0 : v;
+                  } catch (NumberFormatException e) {
+                      return 0;
+                  }
+              }
+
+              /** Lee dinero en pesos: acepta "25000" o "25.000". */
+              public static double pesos(String s) {
+                  if (s == null) return 0;
+                  String d = s.replaceAll("[^0-9]", "");
+                  if (d.isEmpty() || d.length() > 12) return 0;
+                  return Double.parseDouble(d);
+              }
+
+              // ------------------------------------------------------------------- Fechas
+              private static Calendar hoyInicio() {
+                  Calendar c = Calendar.getInstance();
+                  c.set(Calendar.HOUR_OF_DAY, 0);
+                  c.set(Calendar.MINUTE, 0);
+                  c.set(Calendar.SECOND, 0);
+                  c.set(Calendar.MILLISECOND, 0);
+                  return c;
+              }
+
+              public static long inicioSemana() {
+                  Calendar c = hoyInicio();
+                  c.setFirstDayOfWeek(Calendar.MONDAY);
+                  int dow = c.get(Calendar.DAY_OF_WEEK); // domingo = 1 ... sábado = 7
+                  int atras = (dow + 5) % 7;             // lunes = 0 ... domingo = 6
+                  c.add(Calendar.DAY_OF_YEAR, -atras);
+                  return c.getTimeInMillis();
+              }
+
+              public static long inicioMes() {
+                  Calendar c = hoyInicio();
+                  c.set(Calendar.DAY_OF_MONTH, 1);
+                  return c.getTimeInMillis();
+              }
+
+              public static long inicioAnio() {
+                  Calendar c = hoyInicio();
+                  c.set(Calendar.DAY_OF_YEAR, 1);
+                  return c.getTimeInMillis();
+              }
+          }
+          EOF_PATINETA
+          mkdir -p app/src/main/java/com/sebastian/patineta
+          cat > app/src/main/java/com/sebastian/patineta/Notif.java <<'EOF_PATINETA'
+          package com.sebastian.patineta;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.os.Build;
+
+          import java.util.List;
+
+          /** Canales y notificaciones de la app. */
+          public class Notif {
+              static final String CH_AVISOS = "avisos";
+              static final String CH_REC = "recorrido";
+
+              static void channels(Context c) {
+                  NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+                  if (nm.getNotificationChannel(CH_AVISOS) == null) {
+                      NotificationChannel ch = new NotificationChannel(CH_AVISOS, "Avisos de mantenimiento",
+                              NotificationManager.IMPORTANCE_HIGH);
+                      ch.setDescription("Te avisa cuando toca revisar o llevar la patineta al taller");
+                      nm.createNotificationChannel(ch);
+                  }
+                  if (nm.getNotificationChannel(CH_REC) == null) {
+                      NotificationChannel ch = new NotificationChannel(CH_REC, "Recorrido en curso",
+                              NotificationManager.IMPORTANCE_LOW);
+                      ch.setDescription("Se muestra mientras la app mide los km con el GPS");
+                      nm.createNotificationChannel(ch);
+                  }
+              }
+
+              static boolean canNotify(Context c) {
+                  return Build.VERSION.SDK_INT < 33
+                          || c.checkSelfPermission("android.permission.POST_NOTIFICATIONS") == PackageManager.PERMISSION_GRANTED;
+              }
+
+              static void aviso(Context c, int id, String title, String text) {
+                  if (!canNotify(c)) return;
+                  channels(c);
+                  Intent open = new Intent(c, MainActivity.class);
+                  open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(c, 0, open,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  Notification n = new Notification.Builder(c, CH_AVISOS)
+                          .setSmallIcon(android.R.drawable.ic_popup_reminder)
+                          .setColor(Color.parseColor("#111111"))
+                          .setContentTitle(title)
+                          .setContentText(text)
+                          .setStyle(new Notification.BigTextStyle().bigText(text))
+                          .setContentIntent(pi)
+                          .setAutoCancel(true)
+                          .build();
+                  NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm != null) nm.notify(id, n);
+              }
+
+              /**
+               * Revisa los avisos por km. Si alguno acaba de pasar a "pronto" o "toca",
+               * manda la notificación (una sola vez por etapa).
+               * extraKm = km del recorrido que todavía no se ha guardado.
+               */
+              static void checkAvisos(Context c, double extraKm) {
+                  double odo = Datos.odometer(c) + extraKm;
+                  List<Datos.Aviso> list = Datos.loadAvisos(c);
+                  boolean changed = false;
+                  for (Datos.Aviso a : list) {
+                      int lv = Datos.nivel(a, odo);
+                      if (lv > a.notificado) {
+                          a.notificado = lv;
+                          changed = true;
+                          double falta = Datos.falta(a, odo);
+                          int nid = 5000 + (int) (a.id % 100000L);
+                          if (lv == 2) {
+                              aviso(c, nid, "Toca: " + a.nombre,
+                                      "Ya pasaron " + Datos.km1(a.cadaKm) + " km desde el último servicio. Llévala al taller o hazle el mantenimiento.");
+                          } else {
+                              aviso(c, nid, "Pronto toca: " + a.nombre,
+                                      "Faltan " + Datos.km1(falta) + " km para el próximo servicio.");
+                          }
+                      }
+                  }
+                  if (changed) Datos.saveAvisos(c, list);
+              }
+          }
+          EOF_PATINETA
+          mkdir -p app/src/main/java/com/sebastian/patineta
+          cat > app/src/main/java/com/sebastian/patineta/TrackService.java <<'EOF_PATINETA'
+          package com.sebastian.patineta;
+
+          import android.app.Notification;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Color;
+          import android.graphics.drawable.Icon;
+          import android.location.Location;
+          import android.location.LocationListener;
+          import android.location.LocationManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.os.SystemClock;
+          import android.widget.Toast;
+
+          import java.util.Locale;
+
+          /** Mide los km con el GPS aunque la pantalla esté apagada (servicio en primer plano). */
+          public class TrackService extends Service implements LocationListener {
+              public static final String ACT_START = "com.sebastian.patineta.START";
+              public static final String ACT_PAUSE = "com.sebastian.patineta.PAUSE";
+              public static final String ACT_RESUME = "com.sebastian.patineta.RESUME";
+              public static final String ACT_FINISH = "com.sebastian.patineta.FINISH";
+
+              private static final int NID = 77;
+              private static final String PREFS = "recorrido";
+
+              // Estado que lee la pantalla principal
+              static volatile boolean alive = false;
+              static volatile int state = 0;        // 0 sin recorrido, 1 grabando, 2 en pausa
+              static volatile double meters = 0;
+              static volatile long activeMs = 0;    // tiempo de los tramos ya cerrados
+              static volatile long runStart = 0;    // reloj cuando empezó el tramo actual
+              static volatile long startWall = 0;   // hora real en que empezó el recorrido
+
+              private LocationManager lm;
+              private Location last;
+              private long lastNotifyAt = 0;
+              private int lastBucket = 0;
+
+              /** Tiempo en movimiento del recorrido (incluye el tramo que está corriendo). */
+              static long activeNow() {
+                  if (state == 1) return activeMs + (SystemClock.elapsedRealtime() - runStart);
+                  return activeMs;
+              }
+
+              /** Si la app se cerró en medio de un recorrido, lo recupera en pausa. */
+              static void restore(Context c) {
+                  if (alive || state != 0) return;
+                  SharedPreferences p = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+                  if (p.getInt("state", 0) == 0) return;
+                  meters = Double.longBitsToDouble(p.getLong("meters", 0L));
+                  activeMs = p.getLong("active", 0L);
+                  startWall = p.getLong("start", System.currentTimeMillis());
+                  runStart = 0;
+                  state = 2;
+              }
+
+              private void persist() {
+                  SharedPreferences.Editor e = getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit();
+                  e.putInt("state", state);
+                  e.putLong("meters", Double.doubleToRawLongBits(meters));
+                  e.putLong("active", activeNow());
+                  e.putLong("start", startWall);
+                  e.apply();
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+                  Notif.channels(this);
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  String a = intent == null ? null : intent.getAction();
+                  if (a == null) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  switch (a) {
+                      case ACT_START:
+                          if (state == 0) {
+                              meters = 0;
+                              activeMs = 0;
+                              startWall = System.currentTimeMillis();
+                              lastBucket = 0;
+                              Datos.rutaActual(this).delete(); // empieza una ruta nueva
+                          }
+                          if (state != 1) beginRun(); else startFg();
+                          break;
+                      case ACT_RESUME:
+                          if (state != 1) beginRun(); else startFg();
+                          break;
+                      case ACT_PAUSE:
+                          if (state == 1) pauseRun();
+                          break;
+                      case ACT_FINISH:
+                          finishRide();
+                          break;
+                      default:
+                          break;
+                  }
+                  return START_NOT_STICKY;
+              }
+
+              private void startFg() {
+                  Notification n = buildNotif();
+                  try {
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          startForeground(NID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+                      } else {
+                          startForeground(NID, n);
+                      }
+                      alive = true;
+                  } catch (SecurityException e) {
+                      Toast.makeText(this, "Falta el permiso de ubicación", Toast.LENGTH_LONG).show();
+                      state = state == 1 ? 2 : state;
+                      stopSelf();
+                  }
+              }
+
+              private void beginRun() {
+                  startFg();
+                  if (!alive) return;
+                  try {
+                      last = null;
+                      runStart = SystemClock.elapsedRealtime();
+                      state = 1;
+                      lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 2000L, 0f, this, Looper.getMainLooper());
+                  } catch (SecurityException | IllegalArgumentException e) {
+                      state = state == 1 ? 2 : state;
+                      Toast.makeText(this, "No pude usar el GPS. Revisa el permiso de ubicación.", Toast.LENGTH_LONG).show();
+                  }
+                  persist();
+                  updateNotif();
+              }
+
+              private void pauseRun() {
+                  activeMs += SystemClock.elapsedRealtime() - runStart;
+                  state = 2;
+                  lm.removeUpdates(this);
+                  last = null;
+                  persist();
+                  updateNotif();
+              }
+
+              private void finishRide() {
+                  if (state == 1) activeMs += SystemClock.elapsedRealtime() - runStart;
+                  lm.removeUpdates(this);
+                  int before = state;
+                  double km = meters / 1000.0;
+                  long dur = activeMs;
+                  long start = startWall;
+                  state = 0;
+                  meters = 0;
+                  activeMs = 0;
+                  runStart = 0;
+                  last = null;
+                  persist(); // con state = 0 limpia el recorrido guardado
+
+                  if (before != 0) {
+                      if (km >= 0.02) {
+                          Datos.Ride r = new Datos.Ride();
+                          r.id = System.currentTimeMillis();
+                          r.start = start;
+                          r.durMs = dur;
+                          r.km = km;
+                          r.manual = false;
+                          Datos.upsertRide(this, r);
+                          // la ruta del mapa queda guardada con el recorrido
+                          Datos.rutaActual(this).renameTo(Datos.rutaFile(this, r.id));
+                          Notif.checkAvisos(this, 0);
+                          Toast.makeText(this, "Recorrido guardado: " + Datos.km2(km) + " km", Toast.LENGTH_LONG).show();
+                      } else {
+                          Datos.rutaActual(this).delete();
+                          Toast.makeText(this, "Recorrido muy corto, no se guardó", Toast.LENGTH_SHORT).show();
+                      }
+                  }
+                  stopForeground(Service.STOP_FOREGROUND_REMOVE);
+                  alive = false;
+                  stopSelf();
+              }
+
+              @Override
+              public void onDestroy() {
+                  if (lm != null) lm.removeUpdates(this);
+                  if (state == 1) { // el sistema cerró el servicio: dejo el recorrido en pausa
+                      activeMs += SystemClock.elapsedRealtime() - runStart;
+                      state = 2;
+                      persist();
+                  }
+                  alive = false;
+                  super.onDestroy();
+              }
+
+              // ------------------------------------------------------------------ GPS
+              @Override
+              public void onLocationChanged(Location l) {
+                  if (state != 1) return;
+                  if (l.hasAccuracy() && l.getAccuracy() > 30f) return; // señal mala
+                  if (last == null) {
+                      last = l;
+                      // primer punto del tramo para el mapa
+                      Datos.rutaAppend(Datos.rutaActual(this), "S");
+                      Datos.rutaAppend(Datos.rutaActual(this), punto(l));
+                      return;
+                  }
+                  float d = last.distanceTo(l);
+                  long dtNs = l.getElapsedRealtimeNanos() - last.getElapsedRealtimeNanos();
+                  if (dtNs <= 0) return;
+                  double v = d / (dtNs / 1e9);
+                  if (v > 25) return; // salto raro del GPS (más de 90 km/h)
+                  float minMove = Math.max(3f, l.hasAccuracy() ? l.getAccuracy() / 2f : 3f);
+                  if (d < minMove) return; // quieto: es solo ruido del GPS
+                  meters += d;
+                  last = l;
+                  Datos.rutaAppend(Datos.rutaActual(this), punto(l));
+                  persist();
+
+                  int bucket = (int) (meters / 250.0);
+                  if (bucket != lastBucket) {
+                      lastBucket = bucket;
+                      Notif.checkAvisos(this, meters / 1000.0);
+                  }
+                  long now = SystemClock.elapsedRealtime();
+                  if (now - lastNotifyAt > 4000) {
+                      lastNotifyAt = now;
+                      updateNotif();
+                  }
+              }
+
+              private static String punto(Location l) {
+                  return String.format(Locale.US, "%.5f,%.5f", l.getLatitude(), l.getLongitude());
+              }
+
+              @Override
+              public void onStatusChanged(String provider, int status, Bundle extras) { }
+
+              @Override
+              public void onProviderEnabled(String provider) { }
+
+              @Override
+              public void onProviderDisabled(String provider) { }
+
+              // --------------------------------------------------------- Notificación
+              private PendingIntent action(String act, int code) {
+                  Intent i = new Intent(this, TrackService.class);
+                  i.setAction(act);
+                  return PendingIntent.getService(this, code, i,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              }
+
+              private Notification buildNotif() {
+                  Intent open = new Intent(this, MainActivity.class);
+                  open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(this, 0, open,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  boolean running = state == 1;
+                  String title = running ? "Grabando recorrido" : "Recorrido en pausa";
+                  String text = Datos.km2(meters / 1000.0) + " km · " + Datos.clock(activeNow());
+                  Notification.Action toggle = new Notification.Action.Builder(
+                          Icon.createWithResource(this, running ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play),
+                          running ? "Pausar" : "Reanudar",
+                          action(running ? ACT_PAUSE : ACT_RESUME, 1)).build();
+                  Notification.Action finish = new Notification.Action.Builder(
+                          Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
+                          "Terminar",
+                          action(ACT_FINISH, 2)).build();
+                  return new Notification.Builder(this, Notif.CH_REC)
+                          .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                          .setColor(Color.parseColor("#111111"))
+                          .setContentTitle(title)
+                          .setContentText(text)
+                          .setContentIntent(pi)
+                          .setOngoing(true)
+                          .setOnlyAlertOnce(true)
+                          .addAction(toggle)
+                          .addAction(finish)
+                          .build();
+              }
+
+              private void updateNotif() {
+                  NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm != null && alive) nm.notify(NID, buildNotif());
+              }
+          }
+          EOF_PATINETA
+          mkdir -p app/src/main/java/com/sebastian/patineta
+          cat > app/src/main/java/com/sebastian/patineta/MainActivity.java <<'EOF_PATINETA'
+          package com.sebastian.patineta;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.app.DatePickerDialog;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.content.res.Configuration;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.location.LocationManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.Settings;
+          import android.text.InputType;
+          import android.text.TextUtils;
+          import android.util.TypedValue;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.ArrayAdapter;
+          import android.widget.AutoCompleteTextView;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.Spinner;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.util.ArrayList;
+          import java.util.Calendar;
+          import java.util.Collections;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+
+              private static final String FINE = "android.permission.ACCESS_FINE_LOCATION";
+              private static final String COARSE = "android.permission.ACCESS_COARSE_LOCATION";
+              private static final String NOTIF = "android.permission.POST_NOTIFICATIONS";
+
+              // Colores (cambian solos entre modo claro y oscuro): solo negros, blancos y grises
+              int bg, surface, ink, muted, line, accent, accentInk;
+
+              private int tab = 0;                 // 0 Inicio, 1 Taller, 2 Gastos
+              private boolean pendingStart = false;
+              private String pendingAction = TrackService.ACT_START;
+              private boolean showAllRides = false;
+              private int shownState = 0;
+              private double odoBase = 0;          // km guardados (sin el recorrido en curso)
+
+              private LinearLayout content, nav;
+              private ScrollView scroll;
+              private TextView liveTotal, liveKm, liveTime, liveSpeed;
+
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private final Runnable ticker = new Runnable() {
+                  @Override
+                  public void run() {
+                      tick();
+                      handler.postDelayed(this, 1000);
+                  }
+              };
+
+              // ------------------------------------------------------------------ Ciclo de vida
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  setupColors();
+                  getWindow().setStatusBarColor(bg);
+                  getWindow().setNavigationBarColor(surface);
+                  if (!isNight()) {
+                      getWindow().getDecorView().setSystemUiVisibility(
+                              View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+                  }
+                  Notif.channels(this);
+                  buildUi();
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(NOTIF) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{NOTIF}, 1);
+                  }
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  TrackService.restore(this);
+                  render();
+                  handler.removeCallbacks(ticker);
+                  handler.postDelayed(ticker, 1000);
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  handler.removeCallbacks(ticker);
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
+                  if (code == 10 && pendingStart) {
+                      pendingStart = false;
+                      if (checkSelfPermission(FINE) == PackageManager.PERMISSION_GRANTED) {
+                          startRide(pendingAction);
+                      } else {
+                          Toast.makeText(this, "Sin el permiso de ubicación no puedo medir con GPS. Puedes agregar los km a mano.",
+                                  Toast.LENGTH_LONG).show();
+                      }
+                  }
+                  render();
+              }
+
+              private void tick() {
+                  if (TrackService.state != shownState) {
+                      render();
+                      return;
+                  }
+                  if (tab == 0 && TrackService.state != 0 && liveKm != null) {
+                      double km = TrackService.meters / 1000.0;
+                      long ms = TrackService.activeNow();
+                      liveKm.setText(Datos.km2(km));
+                      liveTime.setText(Datos.clock(ms));
+                      liveSpeed.setText(ms > 0 ? Datos.km1(km / (ms / 3600000.0)) : "0,0");
+                      if (liveTotal != null) liveTotal.setText(Datos.km1(odoBase + km));
+                  }
+              }
+
+              // ------------------------------------------------------------------ Utilidades
+              private boolean isNight() {
+                  return (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                          == Configuration.UI_MODE_NIGHT_YES;
+              }
+
+              private int dp(float v) {
+                  return Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics()));
+              }
+
+              private GradientDrawable box(int fill, int stroke, float radius) {
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(fill);
+                  g.setCornerRadius(dp(radius));
+                  if (stroke != 0) g.setStroke(dp(1), stroke);
+                  return g;
+              }
+
+              private TextView text(String s, float sp, int color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+                  t.setTextColor(color);
+                  if (bold) t.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+                  return t;
+              }
+
+              private LinearLayout.LayoutParams lp(int w, int h, int top) {
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, h);
+                  p.topMargin = dp(top);
+                  return p;
+              }
+
+              private void setupColors() {
+                  if (isNight()) {
+                      bg = Color.parseColor("#0A0A0A");
+                      surface = Color.parseColor("#151515");
+                      ink = Color.parseColor("#F2F2F2");
+                      muted = Color.parseColor("#8C8C8C");
+                      line = Color.parseColor("#2B2B2B");
+                      accent = Color.parseColor("#F2F2F2");
+                      accentInk = Color.parseColor("#0A0A0A");
+                  } else {
+                      bg = Color.parseColor("#F4F4F4");
+                      surface = Color.WHITE;
+                      ink = Color.parseColor("#111111");
+                      muted = Color.parseColor("#6E6E6E");
+                      line = Color.parseColor("#E1E1E1");
+                      accent = Color.parseColor("#111111");
+                      accentInk = Color.WHITE;
+                  }
+              }
+
+              private Button primaryButton(String s) {
+                  Button btn = new Button(this);
+                  btn.setText(s);
+                  btn.setAllCaps(false);
+                  btn.setTextColor(accentInk);
+                  btn.setBackground(box(accent, 0, 12));
+                  btn.setStateListAnimator(null);
+                  btn.setPadding(dp(18), 0, dp(18), 0);
+                  return btn;
+              }
+
+              private Button outlineButton(String s) {
+                  Button btn = new Button(this);
+                  btn.setText(s);
+                  btn.setAllCaps(false);
+                  btn.setTextColor(ink);
+                  btn.setBackground(box(surface, line, 12));
+                  btn.setStateListAnimator(null);
+                  btn.setPadding(dp(18), 0, dp(18), 0);
+                  return btn;
+              }
+
+              private TextView pill(String s, boolean solid) {
+                  TextView t = text(s.toUpperCase(Datos.ES), 10, solid ? accentInk : ink, true);
+                  t.setLetterSpacing(0.06f);
+                  t.setPadding(dp(8), dp(2), dp(8), dp(2));
+                  t.setBackground(box(solid ? accent : surface, solid ? accent : muted, 999));
+                  return t;
+              }
+
+              private TextView caps(String s) {
+                  TextView t = text(s.toUpperCase(Datos.ES), 12, muted, true);
+                  t.setLetterSpacing(0.08f);
+                  return t;
+              }
+
+              private LinearLayout card() {
+                  LinearLayout c = new LinearLayout(this);
+                  c.setOrientation(LinearLayout.VERTICAL);
+                  c.setPadding(dp(16), dp(14), dp(16), dp(14));
+                  c.setBackground(box(surface, line, 14));
+                  return c;
+              }
+
+              private void addStat(LinearLayout row, String num, String label) {
+                  LinearLayout s = new LinearLayout(this);
+                  s.setOrientation(LinearLayout.VERTICAL);
+                  s.setPadding(dp(12), dp(10), dp(12), dp(10));
+                  s.setBackground(box(surface, line, 12));
+                  s.addView(text(num, 20, ink, true));
+                  s.addView(text(label, 12, muted, false));
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, -2, 1f);
+                  if (row.getChildCount() > 0) p.leftMargin = dp(8);
+                  row.addView(s, p);
+              }
+
+              private void sectionHeader(String title, String action, Runnable r) {
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.setGravity(Gravity.CENTER_VERTICAL);
+                  row.addView(caps(title), new LinearLayout.LayoutParams(0, -2, 1f));
+                  if (action != null) {
+                      TextView a = text(action, 14, ink, true);
+                      a.setPadding(dp(8), dp(6), 0, dp(6));
+                      a.setOnClickListener(v -> r.run());
+                      row.addView(a);
+                  }
+                  content.addView(row, lp(-1, -2, 24));
+              }
+
+              private View emptyCard(String title, String body) {
+                  LinearLayout e = card();
+                  e.addView(text(title, 16, ink, true));
+                  e.addView(text(body, 14, muted, false), lp(-1, -2, 4));
+                  return e;
+              }
+
+              // ------------------------------------------------------------------ Estructura
+              private void buildUi() {
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(bg);
+
+                  scroll = new ScrollView(this);
+                  content = new LinearLayout(this);
+                  content.setOrientation(LinearLayout.VERTICAL);
+                  content.setPadding(dp(18), dp(20), dp(18), dp(28));
+                  scroll.addView(content);
+                  root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+                  View divider = new View(this);
+                  divider.setBackgroundColor(line);
+                  root.addView(divider, new LinearLayout.LayoutParams(-1, dp(1)));
+
+                  nav = new LinearLayout(this);
+                  nav.setOrientation(LinearLayout.HORIZONTAL);
+                  nav.setBackgroundColor(surface);
+                  root.addView(nav, new LinearLayout.LayoutParams(-1, dp(56)));
+
+                  setContentView(root);
+              }
+
+              private void renderNav() {
+                  nav.removeAllViews();
+                  String[] names = {"Inicio", "Taller", "Gastos"};
+                  for (int i = 0; i < 3; i++) {
+                      final int idx = i;
+                      boolean on = i == tab;
+                      TextView t = text(names[i], 14, on ? ink : muted, on);
+                      t.setGravity(Gravity.CENTER);
+                      t.setOnClickListener(v -> {
+                          tab = idx;
+                          scroll.scrollTo(0, 0);
+                          render();
+                      });
+                      nav.addView(t, new LinearLayout.LayoutParams(0, -1, 1f));
+                  }
+              }
+
+              private void render() {
+                  content.removeAllViews();
+                  liveTotal = null;
+                  liveKm = null;
+                  liveTime = null;
+                  liveSpeed = null;
+                  shownState = TrackService.state;
+                  renderNav();
+                  if (tab == 0) renderInicio();
+                  else if (tab == 1) renderTaller();
+                  else renderGastos();
+              }
+
+              private void header(String title) {
+                  content.addView(caps(Datos.hoy()));
+                  content.addView(text(title, 32, ink, true), lp(-1, -2, 4));
+              }
+
+              private double liveKmValue() {
+                  return TrackService.state != 0 ? TrackService.meters / 1000.0 : 0;
+              }
+
+              private double odoNow() {
+                  return Datos.odometer(this) + liveKmValue();
+              }
+
+              // ------------------------------------------------------------------ Pestaña Inicio
+              private void renderInicio() {
+                  List<Datos.Ride> rides = Datos.loadRides(this);
+                  Collections.sort(rides, (a, b) -> Long.compare(b.start, a.start));
+                  odoBase = Datos.odometer(this);
+                  final int st = TrackService.state;
+                  double live = liveKmValue();
+
+                  header("Patineta");
+
+                  content.addView(caps("Kilómetros totales"), lp(-1, -2, 22));
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.setGravity(Gravity.BOTTOM);
+                  liveTotal = text(Datos.km1(odoBase + live), 56, ink, true);
+                  row.addView(liveTotal);
+                  TextView unit = text(" km", 20, muted, false);
+                  unit.setPadding(dp(4), 0, 0, dp(10));
+                  row.addView(unit);
+                  content.addView(row, lp(-1, -2, 2));
+
+                  long wk = Datos.inicioSemana(), mo = Datos.inicioMes();
+                  double kw = 0, kmo = 0;
+                  for (Datos.Ride r : rides) {
+                      if (r.start >= wk) kw += r.km;
+                      if (r.start >= mo) kmo += r.km;
+                  }
+                  LinearLayout stats = new LinearLayout(this);
+                  stats.setOrientation(LinearLayout.HORIZONTAL);
+                  addStat(stats, Datos.km1(kw), "km esta semana");
+                  addStat(stats, Datos.km1(kmo), "km este mes");
+                  addStat(stats, String.valueOf(rides.size()), "recorridos");
+                  content.addView(stats, lp(-1, -2, 14));
+
+                  // Avisos de mantenimiento que ya tocan o están cerca
+                  double odo = odoBase + live;
+                  for (Datos.Aviso a : Datos.loadAvisos(this)) {
+                      int lv = Datos.nivel(a, odo);
+                      if (lv == 0) continue;
+                      double falta = Datos.falta(a, odo);
+                      String msg = lv == 2
+                              ? "Toca: " + a.nombre + ". Se pasó por " + Datos.km1(-falta) + " km."
+                              : "Pronto: " + a.nombre + ". Faltan " + Datos.km1(falta) + " km.";
+                      LinearLayout b = card();
+                      b.setBackground(box(surface, lv == 2 ? ink : muted, 12));
+                      b.addView(text(msg, 14, ink, lv == 2));
+                      b.setOnClickListener(v -> {
+                          tab = 1;
+                          render();
+                      });
+                      content.addView(b, lp(-1, -2, 10));
+                  }
+
+                  // Tarjeta de recorrido
+                  LinearLayout rec = card();
+                  if (st == 0) {
+                      rec.addView(text("Nuevo recorrido", 18, ink, true));
+                      rec.addView(text("Mide los km con el GPS. Puedes bloquear la pantalla mientras andas.", 14, muted, false),
+                              lp(-1, -2, 4));
+                      Button start = primaryButton("Iniciar recorrido");
+                      start.setOnClickListener(v -> startRide(TrackService.ACT_START));
+                      rec.addView(start, lp(-1, dp(52), 14));
+                  } else {
+                      rec.addView(caps(st == 1 ? "Grabando" : "En pausa"));
+                      LinearLayout kmRow = new LinearLayout(this);
+                      kmRow.setOrientation(LinearLayout.HORIZONTAL);
+                      kmRow.setGravity(Gravity.BOTTOM);
+                      liveKm = text(Datos.km2(live), 44, ink, true);
+                      kmRow.addView(liveKm);
+                      TextView u = text(" km", 18, muted, false);
+                      u.setPadding(dp(4), 0, 0, dp(8));
+                      kmRow.addView(u);
+                      rec.addView(kmRow, lp(-1, -2, 4));
+
+                      LinearLayout info = new LinearLayout(this);
+                      info.setOrientation(LinearLayout.HORIZONTAL);
+                      LinearLayout c1 = new LinearLayout(this);
+                      c1.setOrientation(LinearLayout.VERTICAL);
+                      liveTime = text(Datos.clock(TrackService.activeNow()), 20, ink, true);
+                      c1.addView(liveTime);
+                      c1.addView(text("tiempo", 12, muted, false));
+                      LinearLayout c2 = new LinearLayout(this);
+                      c2.setOrientation(LinearLayout.VERTICAL);
+                      long ms = TrackService.activeNow();
+                      liveSpeed = text(ms > 0 ? Datos.km1(live / (ms / 3600000.0)) : "0,0", 20, ink, true);
+                      c2.addView(liveSpeed);
+                      c2.addView(text("km/h promedio", 12, muted, false));
+                      info.addView(c1, new LinearLayout.LayoutParams(0, -2, 1f));
+                      info.addView(c2, new LinearLayout.LayoutParams(0, -2, 1f));
+                      rec.addView(info, lp(-1, -2, 12));
+
+                      LinearLayout btns = new LinearLayout(this);
+                      btns.setOrientation(LinearLayout.HORIZONTAL);
+                      Button pause = outlineButton(st == 1 ? "Pausar" : "Reanudar");
+                      pause.setOnClickListener(v -> {
+                          if (st == 1) sendToService(TrackService.ACT_PAUSE, false);
+                          else startRide(TrackService.ACT_RESUME);
+                      });
+                      Button fin = primaryButton("Terminar");
+                      fin.setOnClickListener(v -> confirmFinish());
+                      btns.addView(pause, new LinearLayout.LayoutParams(0, dp(50), 1f));
+                      LinearLayout.LayoutParams fp = new LinearLayout.LayoutParams(0, dp(50), 1f);
+                      fp.leftMargin = dp(8);
+                      btns.addView(fin, fp);
+                      rec.addView(btns, lp(-1, -2, 16));
+
+                      Button mapBtn = outlineButton("Ver mapa en vivo");
+                      mapBtn.setOnClickListener(v -> {
+                          Intent mi = new Intent(this, MapaActivity.class);
+                          mi.putExtra("live", true);
+                          startActivity(mi);
+                      });
+                      rec.addView(mapBtn, lp(-1, dp(48), 10));
+                  }
+                  content.addView(rec, lp(-1, -2, 18));
+
+                  // Ruta diaria guardada (el mapa funciona sin internet)
+                  if (Datos.rutaDiaria(this).exists()) {
+                      LinearLayout dc = card();
+                      dc.addView(text("Mi ruta diaria", 16, ink, true));
+                      dc.addView(text(MapCache.info(this) + "  ·  funciona sin internet", 13, muted, false), lp(-1, -2, 2));
+                      Button vb = outlineButton("Ver mapa");
+                      vb.setOnClickListener(v -> {
+                          Intent mi = new Intent(this, MapaActivity.class);
+                          mi.putExtra("daily", true);
+                          startActivity(mi);
+                      });
+                      dc.addView(vb, lp(-1, dp(46), 12));
+                      content.addView(dc, lp(-1, -2, 12));
+                  }
+
+                  // Historial
+                  sectionHeader("Recorridos", "+ A mano", () -> rideDialog(null));
+                  if (rides.isEmpty()) {
+                      content.addView(emptyCard("Aún no hay recorridos",
+                              "Inicia uno con el GPS o agrega los km a mano con \"+ A mano\"."), lp(-1, -2, 8));
+                  } else {
+                      int max = showAllRides ? rides.size() : Math.min(8, rides.size());
+                      for (int i = 0; i < max; i++) content.addView(rideCard(rides.get(i)), lp(-1, -2, 8));
+                      if (rides.size() > 8) {
+                          TextView tg = text(showAllRides ? "Ver menos" : "Ver todos (" + rides.size() + ")", 14, muted, true);
+                          tg.setPadding(0, dp(12), 0, dp(4));
+                          tg.setOnClickListener(v -> {
+                              showAllRides = !showAllRides;
+                              render();
+                          });
+                          content.addView(tg, lp(-1, -2, 6));
+                      }
+                  }
+
+                  // Km iniciales
+                  sectionHeader("Ajustes", null, null);
+                  LinearLayout base = card();
+                  base.addView(text("Km iniciales de la patineta", 15, ink, true));
+                  base.addView(text(Datos.km1(Datos.baseKm(this)) + " km  ·  toca para cambiar", 13, muted, false), lp(-1, -2, 2));
+                  base.setOnClickListener(v -> baseDialog());
+                  content.addView(base, lp(-1, -2, 8));
+              }
+
+              private View rideCard(Datos.Ride r) {
+                  LinearLayout c = card();
+                  c.setOrientation(LinearLayout.HORIZONTAL);
+                  c.setGravity(Gravity.CENTER_VERTICAL);
+                  LinearLayout left = new LinearLayout(this);
+                  left.setOrientation(LinearLayout.VERTICAL);
+                  left.addView(text(Datos.fechaHora(r.start), 15, ink, true));
+                  String meta;
+                  if (r.durMs > 0) {
+                      meta = Datos.dur(r.durMs) + "  ·  " + Datos.km1(r.km / (r.durMs / 3600000.0)) + " km/h";
+                  } else {
+                      meta = r.manual ? "Agregado a mano" : "Sin tiempo";
+                  }
+                  if (r.durMs > 0 && r.manual) meta += "  ·  a mano";
+                  left.addView(text(meta, 13, muted, false), lp(-1, -2, 2));
+                  c.addView(left, new LinearLayout.LayoutParams(0, -2, 1f));
+                  if (Datos.rutaFile(this, r.id).exists()) {
+                      TextView mp = pill("Mapa", false);
+                      mp.setPadding(dp(12), dp(6), dp(12), dp(6));
+                      mp.setOnClickListener(v -> {
+                          Intent mi = new Intent(this, MapaActivity.class);
+                          mi.putExtra("rideId", r.id);
+                          startActivity(mi);
+                      });
+                      LinearLayout.LayoutParams mpp = new LinearLayout.LayoutParams(-2, -2);
+                      mpp.rightMargin = dp(12);
+                      c.addView(mp, mpp);
+                  }
+                  c.addView(text(Datos.km2(r.km) + " km", 17, ink, true));
+                  c.setOnClickListener(v -> rideDialog(r));
+                  return c;
+              }
+
+              // ------------------------------------------------------------------ Iniciar / pausar / terminar
+              private void startRide(String action) {
+                  if (checkSelfPermission(FINE) != PackageManager.PERMISSION_GRANTED) {
+                      pendingStart = true;
+                      pendingAction = action;
+                      String[] perms = Build.VERSION.SDK_INT >= 33
+                              ? new String[]{FINE, COARSE, NOTIF} : new String[]{FINE, COARSE};
+                      requestPermissions(perms, 10);
+                      return;
+                  }
+                  LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+                  if (lm == null || !lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                      Toast.makeText(this, "Activa la ubicación (GPS) del celular para medir los km", Toast.LENGTH_LONG).show();
+                      try {
+                          startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS));
+                      } catch (Exception ignored) { }
+                      return;
+                  }
+                  sendToService(action, true);
+              }
+
+              private void sendToService(String action, boolean foreground) {
+                  Intent i = new Intent(this, TrackService.class);
+                  i.setAction(action);
+                  if (foreground) startForegroundService(i);
+                  else startService(i);
+              }
+
+              private void confirmFinish() {
+                  double km = TrackService.meters / 1000.0;
+                  new AlertDialog.Builder(this)
+                          .setTitle("¿Terminar el recorrido?")
+                          .setMessage("Se guardarán " + Datos.km2(km) + " km en " + Datos.dur(TrackService.activeNow()) + ".")
+                          .setPositiveButton("Terminar", (d, w) -> sendToService(TrackService.ACT_FINISH, false))
+                          .setNegativeButton("Seguir", null)
+                          .show();
+              }
+
+              // ------------------------------------------------------------------ Pestaña Taller
+              private void renderTaller() {
+                  header("Taller");
+                  double odo = odoNow();
+
+                  sectionHeader("Avisos por km", "+ Nuevo", () -> avisoDialog(null));
+                  List<Datos.Aviso> avisos = Datos.loadAvisos(this);
+                  Collections.sort(avisos, (a, b) -> Double.compare(Datos.falta(a, odo), Datos.falta(b, odo)));
+                  if (avisos.isEmpty()) {
+                      content.addView(emptyCard("Sin avisos todavía",
+                              "Crea uno por cada pieza o tarea. Ej.: Frenos cada 300 km, Revisión en taller cada 1.000 km. La app te avisa cuando se acerque."),
+                              lp(-1, -2, 8));
+                  } else {
+                      for (Datos.Aviso a : avisos) content.addView(avisoCard(a, odo), lp(-1, -2, 8));
+                  }
+
+                  sectionHeader("Bitácora", "+ Anotación", () -> entryDialog(null, 0));
+                  List<Datos.Entry> entries = Datos.loadEntries(this);
+                  Collections.sort(entries, (a, b) -> Long.compare(b.date, a.date));
+                  if (entries.isEmpty()) {
+                      content.addView(emptyCard("Bitácora vacía",
+                              "Anota reparaciones, cambios de piezas, compras o lo que le hagas a la patineta, con la fecha y los km."),
+                              lp(-1, -2, 8));
+                  } else {
+                      for (Datos.Entry e : entries) content.addView(entryCard(e), lp(-1, -2, 8));
+                  }
+              }
+
+              private View avisoCard(Datos.Aviso a, double odo) {
+                  int lv = Datos.nivel(a, odo);
+                  double falta = Datos.falta(a, odo);
+                  double used = odo - a.ultimoKm;
+                  double frac = a.cadaKm > 0 ? Math.max(0, Math.min(1, used / a.cadaKm)) : 0;
+
+                  LinearLayout c = card();
+                  LinearLayout top = new LinearLayout(this);
+                  top.setOrientation(LinearLayout.HORIZONTAL);
+                  top.setGravity(Gravity.CENTER_VERTICAL);
+                  top.addView(text(a.nombre, 16, ink, true), new LinearLayout.LayoutParams(0, -2, 1f));
+                  if (lv == 2) top.addView(pill("Toca", true));
+                  else if (lv == 1) top.addView(pill("Pronto", false));
+                  c.addView(top);
+                  c.addView(text("Cada " + Datos.km1(a.cadaKm) + " km  ·  último servicio a los " + Datos.km1(a.ultimoKm) + " km",
+                          13, muted, false), lp(-1, -2, 4));
+
+                  LinearLayout bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.HORIZONTAL);
+                  bar.setBackground(box(line, 0, 3));
+                  View fill = new View(this);
+                  fill.setBackground(box(ink, 0, 3));
+                  bar.addView(fill, new LinearLayout.LayoutParams(0, -1, (float) frac));
+                  bar.addView(new View(this), new LinearLayout.LayoutParams(0, -1, (float) (1 - frac)));
+                  c.addView(bar, lp(-1, dp(6), 12));
+
+                  LinearLayout bottom = new LinearLayout(this);
+                  bottom.setOrientation(LinearLayout.HORIZONTAL);
+                  bottom.setGravity(Gravity.CENTER_VERTICAL);
+                  String s = falta > 0 ? "Faltan " + Datos.km1(falta) + " km" : "Se pasó por " + Datos.km1(-falta) + " km";
+                  bottom.addView(text(s, 14, ink, true), new LinearLayout.LayoutParams(0, -2, 1f));
+                  Button done = outlineButton("Hecho");
+                  done.setMinHeight(0);
+                  done.setMinimumHeight(0);
+                  done.setPadding(dp(16), dp(6), dp(16), dp(6));
+                  done.setOnClickListener(v -> avisoHecho(a));
+                  bottom.addView(done, new LinearLayout.LayoutParams(-2, dp(38)));
+                  c.addView(bottom, lp(-1, -2, 8));
+
+                  c.setOnClickListener(v -> avisoDialog(a));
+                  return c;
+              }
+
+              private View entryCard(Datos.Entry e) {
+                  LinearLayout c = card();
+                  LinearLayout top = new LinearLayout(this);
+                  top.setOrientation(LinearLayout.HORIZONTAL);
+                  top.setGravity(Gravity.CENTER_VERTICAL);
+                  top.addView(text(e.titulo, 16, ink, true), new LinearLayout.LayoutParams(0, -2, 1f));
+                  LinearLayout.LayoutParams pp = new LinearLayout.LayoutParams(-2, -2);
+                  pp.leftMargin = dp(8);
+                  top.addView(pill(Datos.TIPOS[e.tipo], false), pp);
+                  c.addView(top);
+                  String meta = Datos.fecha(e.date) + (e.km > 0 ? "  ·  a los " + Datos.km1(e.km) + " km" : "");
+                  c.addView(text(meta, 13, muted, false), lp(-1, -2, 4));
+                  if (!e.notas.isEmpty()) {
+                      TextView n = text(e.notas, 14, ink, false);
+                      n.setMaxLines(3);
+                      n.setEllipsize(TextUtils.TruncateAt.END);
+                      c.addView(n, lp(-1, -2, 6));
+                  }
+                  if (e.costo > 0) c.addView(text(Datos.money(e.costo), 15, ink, true), lp(-1, -2, 6));
+                  c.setOnClickListener(v -> entryDialog(e, e.tipo));
+                  return c;
+              }
+
+              // ------------------------------------------------------------------ Pestaña Gastos
+              private void renderGastos() {
+                  header("Gastos");
+                  List<Datos.Entry> all = Datos.loadEntries(this);
+                  List<Datos.Entry> gastos = new ArrayList<>();
+                  double total = 0, mes = 0, anio = 0;
+                  double[] porTipo = new double[Datos.TIPOS.length];
+                  long mo = Datos.inicioMes(), yr = Datos.inicioAnio();
+                  for (Datos.Entry e : all) {
+                      if (e.costo <= 0) continue;
+                      gastos.add(e);
+                      total += e.costo;
+                      porTipo[e.tipo] += e.costo;
+                      if (e.date >= mo) mes += e.costo;
+                      if (e.date >= yr) anio += e.costo;
+                  }
+                  Collections.sort(gastos, (a, b) -> Long.compare(b.date, a.date));
+
+                  content.addView(caps("Total gastado"), lp(-1, -2, 22));
+                  content.addView(text(Datos.money(total), 40, ink, true), lp(-1, -2, 2));
+
+                  double recorridos = Datos.odometer(this) - Datos.baseKm(this);
+                  LinearLayout stats = new LinearLayout(this);
+                  stats.setOrientation(LinearLayout.HORIZONTAL);
+                  addStat(stats, Datos.money(mes), "este mes");
+                  addStat(stats, Datos.money(anio), "este año");
+                  addStat(stats, recorridos >= 1 && total > 0 ? Datos.money(total / recorridos) : "–", "por km");
+                  content.addView(stats, lp(-1, -2, 14));
+
+                  if (total > 0) {
+                      sectionHeader("Por tipo", null, null);
+                      LinearLayout box = card();
+                      boolean first = true;
+                      for (int i = 0; i < porTipo.length; i++) {
+                          if (porTipo[i] <= 0) continue;
+                          LinearLayout r = new LinearLayout(this);
+                          r.setOrientation(LinearLayout.HORIZONTAL);
+                          r.addView(text(Datos.TIPOS[i], 14, ink, false), new LinearLayout.LayoutParams(0, -2, 1f));
+                          r.addView(text(Datos.money(porTipo[i]), 14, ink, true));
+                          box.addView(r, lp(-1, -2, first ? 0 : 10));
+                          double frac = porTipo[i] / total;
+                          LinearLayout bar = new LinearLayout(this);
+                          bar.setOrientation(LinearLayout.HORIZONTAL);
+                          bar.setBackground(box(line, 0, 2));
+                          View fill = new View(this);
+                          fill.setBackground(box(ink, 0, 2));
+                          bar.addView(fill, new LinearLayout.LayoutParams(0, -1, (float) frac));
+                          bar.addView(new View(this), new LinearLayout.LayoutParams(0, -1, (float) (1 - frac)));
+                          box.addView(bar, lp(-1, dp(4), 6));
+                          first = false;
+                      }
+                      content.addView(box, lp(-1, -2, 8));
+                  }
+
+                  sectionHeader("Movimientos", "+ Nuevo gasto", () -> entryDialog(null, 3));
+                  if (gastos.isEmpty()) {
+                      content.addView(emptyCard("Sin gastos todavía",
+                              "Anota lo que compras o pagas por la patineta. Toda anotación con costo aparece aquí."),
+                              lp(-1, -2, 8));
+                  } else {
+                      for (Datos.Entry e : gastos) content.addView(entryCard(e), lp(-1, -2, 8));
+                  }
+              }
+
+              // ------------------------------------------------------------------ Diálogos
+              private LinearLayout dialogBox() {
+                  LinearLayout v = new LinearLayout(this);
+                  v.setOrientation(LinearLayout.VERTICAL);
+                  v.setPadding(dp(22), dp(10), dp(22), dp(6));
+                  return v;
+              }
+
+              private TextView label(String s) {
+                  TextView t = text(s, 13, muted, true);
+                  t.setPadding(0, dp(14), 0, dp(2));
+                  return t;
+              }
+
+              private EditText field(String hint, String value, int type) {
+                  EditText e = new EditText(this);
+                  e.setHint(hint);
+                  e.setInputType(type);
+                  e.setText(value);
+                  return e;
+              }
+
+              private Button dateButton(Calendar cal) {
+                  Button b = outlineButton(Datos.fechaLarga(cal.getTimeInMillis()));
+                  b.setOnClickListener(x -> new DatePickerDialog(this, (dp, y, m, d) -> {
+                      cal.set(y, m, d);
+                      b.setText(Datos.fechaLarga(cal.getTimeInMillis()));
+                  }, cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)).show());
+                  return b;
+              }
+
+              private static final int DECIMAL = InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL;
+              private static final int ENTERO = InputType.TYPE_CLASS_NUMBER;
+              private static final int TEXTO = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES;
+
+              private void confirmDelete(String title, String msg, Runnable onYes) {
+                  new AlertDialog.Builder(this)
+                          .setTitle(title)
+                          .setMessage(msg + "\n\nNo se puede deshacer.")
+                          .setPositiveButton("Eliminar", (a, w) -> onYes.run())
+                          .setNegativeButton("Cancelar", null)
+                          .show();
+              }
+
+              /** Agregar un recorrido a mano o corregir uno existente. */
+              private void rideDialog(Datos.Ride existing) {
+                  final boolean editing = existing != null;
+                  final Calendar cal = Calendar.getInstance();
+                  if (editing) cal.setTimeInMillis(existing.start);
+
+                  LinearLayout v = dialogBox();
+                  v.addView(label("Fecha"));
+                  v.addView(dateButton(cal));
+                  v.addView(label("Kilómetros"));
+                  EditText kmF = field("Ej.: 8,5", editing ? Datos.campo(existing.km) : "", DECIMAL);
+                  v.addView(kmF);
+                  v.addView(label("Duración en minutos (opcional)"));
+                  final String origMin = editing && existing.durMs > 0 ? String.valueOf(existing.durMs / 60000) : "";
+                  EditText minF = field("Ej.: 35", origMin, ENTERO);
+                  v.addView(minF);
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.addView(v);
+                  AlertDialog.Builder b = new AlertDialog.Builder(this)
+                          .setTitle(editing ? "Editar recorrido" : "Agregar recorrido a mano")
+                          .setView(sv)
+                          .setPositiveButton("Guardar", null)
+                          .setNegativeButton("Cancelar", null);
+                  if (editing) b.setNeutralButton("Eliminar", null);
+                  AlertDialog d = b.create();
+                  d.setOnShowListener(x -> {
+                      d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(y -> {
+                          double km = Datos.num(kmF.getText().toString());
+                          if (km <= 0) {
+                              kmF.setError("Escribe los km");
+                              return;
+                          }
+                          Datos.Ride r = editing ? existing : new Datos.Ride();
+                          if (!editing) {
+                              r.id = System.currentTimeMillis();
+                              r.manual = true;
+                          }
+                          r.start = cal.getTimeInMillis();
+                          r.km = km;
+                          String mins = minF.getText().toString().trim();
+                          if (!(editing && mins.equals(origMin))) r.durMs = (long) Datos.num(mins) * 60000L;
+                          Datos.upsertRide(this, r);
+                          Notif.checkAvisos(this, liveKmValue());
+                          d.dismiss();
+                          render();
+                      });
+                      if (editing) {
+                          d.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(y ->
+                                  confirmDelete("¿Eliminar este recorrido?",
+                                          Datos.fechaHora(existing.start) + " · " + Datos.km2(existing.km) + " km", () -> {
+                                              Datos.deleteRide(this, existing.id);
+                                              d.dismiss();
+                                              render();
+                                          }));
+                      }
+                  });
+                  d.show();
+              }
+
+              private void baseDialog() {
+                  LinearLayout v = dialogBox();
+                  v.addView(text("Si tu patineta ya tenía km antes de usar la app, escríbelos aquí. Se suman al total.",
+                          14, muted, false));
+                  EditText f = field("Ej.: 350", Datos.baseKm(this) > 0 ? Datos.campo(Datos.baseKm(this)) : "", DECIMAL);
+                  v.addView(f, lp(-1, -2, 8));
+                  new AlertDialog.Builder(this)
+                          .setTitle("Km iniciales")
+                          .setView(v)
+                          .setPositiveButton("Guardar", (d, w) -> {
+                              Datos.setBaseKm(this, Datos.num(f.getText().toString()));
+                              render();
+                          })
+                          .setNegativeButton("Cancelar", null)
+                          .show();
+              }
+
+              /** Crear o editar un aviso por km. */
+              private void avisoDialog(Datos.Aviso existing) {
+                  final boolean editing = existing != null;
+                  final double odo = odoNow();
+
+                  LinearLayout v = dialogBox();
+                  v.addView(label("Pieza o tarea"));
+                  AutoCompleteTextView name = new AutoCompleteTextView(this);
+                  name.setHint("Ej.: Frenos");
+                  name.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+                  String[] sugs = {"Revisión en taller", "Frenos", "Llantas", "Rodamientos", "Tornillería", "Lubricación", "Limpieza general"};
+                  name.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_dropdown_item_1line, sugs));
+                  name.setThreshold(0);
+                  name.setOnFocusChangeListener((x, f) -> { if (f) name.showDropDown(); });
+                  name.setOnClickListener(x -> name.showDropDown());
+                  if (editing) name.setText(existing.nombre);
+                  v.addView(name);
+
+                  v.addView(label("Avisarme cada (km)"));
+                  EditText cada = field("Ej.: 300", editing ? Datos.campo(existing.cadaKm) : "", DECIMAL);
+                  v.addView(cada);
+
+                  v.addView(label("Último servicio a los (km)"));
+                  EditText ult = field("Km de la patineta", Datos.campo(editing ? existing.ultimoKm : odo), DECIMAL);
+                  v.addView(ult);
+                  v.addView(text("Ahora la patineta tiene " + Datos.km1(odo) + " km.", 12, muted, false), lp(-1, -2, 4));
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.addView(v);
+                  AlertDialog.Builder b = new AlertDialog.Builder(this)
+                          .setTitle(editing ? "Editar aviso" : "Nuevo aviso")
+                          .setView(sv)
+                          .setPositiveButton("Guardar", null)
+                          .setNegativeButton("Cancelar", null);
+                  if (editing) b.setNeutralButton("Eliminar", null);
+                  AlertDialog d = b.create();
+                  d.setOnShowListener(x -> {
+                      d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(y -> {
+                          String nm = name.getText().toString().trim();
+                          double ck = Datos.num(cada.getText().toString());
+                          if (TextUtils.isEmpty(nm)) {
+                              name.setError("Escribe la pieza o tarea");
+                              return;
+                          }
+                          if (ck <= 0) {
+                              cada.setError("Escribe cada cuántos km");
+                              return;
+                          }
+                          Datos.Aviso a = editing ? existing : new Datos.Aviso();
+                          if (!editing) a.id = System.currentTimeMillis();
+                          a.nombre = nm;
+                          a.cadaKm = ck;
+                          a.ultimoKm = Datos.num(ult.getText().toString());
+                          a.notificado = Datos.nivel(a, odo); // no avisar por algo que ya se sabe
+                          Datos.upsertAviso(this, a);
+                          d.dismiss();
+                          render();
+                      });
+                      if (editing) {
+                          d.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(y ->
+                                  confirmDelete("¿Eliminar este aviso?", existing.nombre, () -> {
+                                      Datos.deleteAviso(this, existing.id);
+                                      d.dismiss();
+                                      render();
+                                  }));
+                      }
+                  });
+                  d.show();
+              }
+
+              /** Marca un aviso como hecho: reinicia el conteo y deja la anotación en la bitácora. */
+              private void avisoHecho(Datos.Aviso a) {
+                  final double odo = odoNow();
+                  LinearLayout v = dialogBox();
+                  v.addView(text("Se marca como hecho a los " + Datos.km1(odo) + " km y se anota en la bitácora.",
+                          14, muted, false));
+                  EditText costo = field("Costo en pesos (opcional)", "", ENTERO);
+                  v.addView(costo, lp(-1, -2, 8));
+                  new AlertDialog.Builder(this)
+                          .setTitle("Hecho: " + a.nombre)
+                          .setView(v)
+                          .setPositiveButton("Guardar", (d, w) -> {
+                              a.ultimoKm = odo;
+                              a.notificado = 0;
+                              Datos.upsertAviso(this, a);
+                              Datos.Entry e = new Datos.Entry();
+                              e.id = System.currentTimeMillis();
+                              e.date = System.currentTimeMillis();
+                              e.tipo = 0;
+                              e.titulo = a.nombre;
+                              e.notas = "Hecho por aviso de cada " + Datos.km1(a.cadaKm) + " km";
+                              e.km = odo;
+                              e.costo = Datos.pesos(costo.getText().toString());
+                              Datos.upsertEntry(this, e);
+                              render();
+                          })
+                          .setNegativeButton("Cancelar", null)
+                          .show();
+              }
+
+              /** Crear o editar una anotación de la bitácora (o un gasto). */
+              private void entryDialog(Datos.Entry existing, int defaultTipo) {
+                  final boolean editing = existing != null;
+                  final Calendar cal = Calendar.getInstance();
+                  if (editing) cal.setTimeInMillis(existing.date);
+
+                  LinearLayout v = dialogBox();
+                  v.addView(label("Tipo"));
+                  Spinner tipo = new Spinner(this);
+                  tipo.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, Datos.TIPOS));
+                  tipo.setSelection(editing ? existing.tipo : defaultTipo);
+                  v.addView(tipo);
+
+                  v.addView(label("¿Qué hiciste o compraste?"));
+                  EditText titulo = field("Ej.: Cambio de llanta trasera", editing ? existing.titulo : "", TEXTO);
+                  v.addView(titulo);
+
+                  v.addView(label("Notas (opcional)"));
+                  EditText notas = field("Marca, taller, qué falló...", editing ? existing.notas : "",
+                          TEXTO | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+                  notas.setMinLines(2);
+                  v.addView(notas);
+
+                  v.addView(label("Costo en pesos (opcional)"));
+                  EditText costo = field("Ej.: 45000", editing && existing.costo > 0 ? Datos.campo(existing.costo) : "", ENTERO);
+                  v.addView(costo);
+
+                  v.addView(label("Fecha"));
+                  v.addView(dateButton(cal));
+
+                  v.addView(label("Km de la patineta en ese momento"));
+                  EditText kmF = field("Km", Datos.campo(editing ? existing.km : odoNow()), DECIMAL);
+                  v.addView(kmF);
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.addView(v);
+                  AlertDialog.Builder b = new AlertDialog.Builder(this)
+                          .setTitle(editing ? "Editar anotación" : "Nueva anotación")
+                          .setView(sv)
+                          .setPositiveButton("Guardar", null)
+                          .setNegativeButton("Cancelar", null);
+                  if (editing) b.setNeutralButton("Eliminar", null);
+                  AlertDialog d = b.create();
+                  d.setOnShowListener(x -> {
+                      d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(y -> {
+                          String tt = titulo.getText().toString().trim();
+                          if (TextUtils.isEmpty(tt)) {
+                              titulo.setError("Escribe qué hiciste o compraste");
+                              return;
+                          }
+                          Datos.Entry e = editing ? existing : new Datos.Entry();
+                          if (!editing) e.id = System.currentTimeMillis();
+                          e.tipo = tipo.getSelectedItemPosition();
+                          e.titulo = tt;
+                          e.notas = notas.getText().toString().trim();
+                          e.costo = Datos.pesos(costo.getText().toString());
+                          e.date = cal.getTimeInMillis();
+                          e.km = Datos.num(kmF.getText().toString());
+                          Datos.upsertEntry(this, e);
+                          d.dismiss();
+                          render();
+                      });
+                      if (editing) {
+                          d.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(y ->
+                                  confirmDelete("¿Eliminar esta anotación?", existing.titulo, () -> {
+                                      Datos.deleteEntry(this, existing.id);
+                                      d.dismiss();
+                                      render();
+                                  }));
+                      }
+                  });
+                  d.show();
+              }
+          }
+          EOF_PATINETA
+          mkdir -p app/src/main/java/com/sebastian/patineta
+          cat > app/src/main/java/com/sebastian/patineta/MapaActivity.java <<'EOF_PATINETA'
+          package com.sebastian.patineta;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.res.Configuration;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.TypedValue;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.io.ByteArrayInputStream;
+          import java.io.File;
+          import java.util.HashMap;
+          import java.util.List;
+
+          /**
+           * Muestra la ruta en un mapa (CARTO / OpenStreetMap, en blanco y negro).
+           * Lo que se ve con internet queda guardado, así que la ruta guardada se abre sin datos.
+           */
+          public class MapaActivity extends Activity {
+
+              private WebView web;
+              private boolean live;
+              private boolean daily;
+              private boolean ready = false;
+              private File ruta;
+              private TextView status;
+              private MapCache.Job job;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private final Runnable refresh = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (live && TrackService.state == 0) { // el recorrido ya terminó
+                          finish();
+                          return;
+                      }
+                      push();
+                      if (live) handler.postDelayed(this, 3000);
+                  }
+              };
+
+              private static final String HTML =
+                      "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                      + "<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>"
+                      + "<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'>"
+                      + "<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>"
+                      + "<style>"
+                      + "html,body{margin:0;height:100%;background:__BG__}"
+                      + "#map{position:absolute;top:0;left:0;right:0;bottom:0;background:__BG__}"
+                      + ".leaflet-tile-pane{filter:__FILTER__}"
+                      + "#msg{position:absolute;z-index:1000;top:14px;left:14px;right:14px;padding:12px 14px;"
+                      + "border-radius:12px;font:14px sans-serif;background:__CARD__;color:__INK__;display:none;text-align:center}"
+                      + "</style></head><body><div id='map'></div><div id='msg'></div><script>"
+                      + "var NIGHT=__NIGHT__;var map=null,layer=null,started=false;"
+                      + "function msg(t){var m=document.getElementById('msg');m.textContent=t;m.style.display=t?'block':'none';}"
+                      + "function init(){"
+                      + "if(typeof L==='undefined'){msg('Necesitas internet para ver el mapa por primera vez');return false;}"
+                      + "map=L.map('map',{zoomControl:false,minZoom:11,maxZoom:19}).setView([4.711,-74.072],13);"
+                      + "L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',"
+                      + "{subdomains:'abcd',minZoom:11,maxZoom:19,maxNativeZoom:17,attribution:'&copy; OpenStreetMap &copy; CARTO'}).addTo(map);"
+                      + "layer=L.layerGroup().addTo(map);return true;}"
+                      + "var ok=init();"
+                      + "function update(segs,live,ref){"
+                      + "if(!ok){ok=init();if(!ok)return;}"
+                      + "layer.clearLayers();"
+                      + "var c=NIGHT?'#F2F2F2':'#111111';var inv=NIGHT?'#0A0A0A':'#FFFFFF';var all=[];"
+                      + "for(var k=0;k<ref.length;k++){if(ref[k].length>1){"
+                      + "L.polyline(ref[k],{color:'#8C8C8C',weight:4,opacity:0.9,dashArray:'6,8'}).addTo(layer);}}"
+                      + "for(var i=0;i<segs.length;i++){"
+                      + "if(segs[i].length>1){L.polyline(segs[i],{color:c,weight:5,opacity:0.95,lineJoin:'round'}).addTo(layer);}"
+                      + "for(var j=0;j<segs[i].length;j++){all.push(segs[i][j]);}}"
+                      + "if(all.length==0){msg(live?'Esperando la señal del GPS...':'Este recorrido no tiene ruta guardada');return;}"
+                      + "msg('');var a=all[0],b=all[all.length-1];"
+                      + "L.circleMarker(a,{radius:6,color:c,weight:2,fillColor:inv,fillOpacity:1}).addTo(layer);"
+                      + "L.circleMarker(b,{radius:9,color:inv,weight:3,fillColor:c,fillOpacity:1}).addTo(layer);"
+                      + "if(live){if(!started){map.setView(b,17);started=true;}else{map.panTo(b);}}"
+                      + "else if(!started){if(all.length>1){map.fitBounds(L.latLngBounds(all),{padding:[40,40]});}else{map.setView(b,17);}started=true;}"
+                      + "}"
+                      + "</script></body></html>";
+
+              private boolean isNight() {
+                  return (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                          == Configuration.UI_MODE_NIGHT_YES;
+              }
+
+              private int dp(float v) {
+                  return Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics()));
+              }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  live = getIntent().getBooleanExtra("live", false);
+                  daily = getIntent().getBooleanExtra("daily", false);
+                  long rideId = getIntent().getLongExtra("rideId", 0L);
+                  if (live) ruta = Datos.rutaActual(this);
+                  else if (daily) ruta = Datos.rutaDiaria(this);
+                  else ruta = Datos.rutaFile(this, rideId);
+
+                  boolean night = isNight();
+                  int bg = Color.parseColor(night ? "#0A0A0A" : "#F4F4F4");
+                  int surface = Color.parseColor(night ? "#151515" : "#FFFFFF");
+                  int ink = Color.parseColor(night ? "#F2F2F2" : "#111111");
+                  int muted = Color.parseColor(night ? "#8C8C8C" : "#6E6E6E");
+                  int line = Color.parseColor(night ? "#2B2B2B" : "#E1E1E1");
+                  getWindow().setStatusBarColor(surface);
+                  getWindow().setNavigationBarColor(surface);
+                  if (!night) {
+                      getWindow().getDecorView().setSystemUiVisibility(
+                              View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+                  }
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(bg);
+
+                  LinearLayout bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.HORIZONTAL);
+                  bar.setGravity(Gravity.CENTER_VERTICAL);
+                  bar.setBackgroundColor(surface);
+                  bar.setPadding(dp(8), 0, dp(8), 0);
+                  TextView back = new TextView(this);
+                  back.setText("‹  Volver");
+                  back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+                  back.setTextColor(ink);
+                  back.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+                  back.setPadding(dp(12), dp(14), dp(12), dp(14));
+                  back.setOnClickListener(v -> finish());
+                  bar.addView(back, new LinearLayout.LayoutParams(0, -2, 1f));
+                  if (!live) {
+                      TextView action = new TextView(this);
+                      action.setText(daily ? "Descargar de nuevo" : "Guardar sin internet");
+                      action.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                      action.setTextColor(ink);
+                      action.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+                      action.setPadding(dp(12), dp(14), dp(12), dp(14));
+                      action.setOnClickListener(v -> onGuardar());
+                      bar.addView(action);
+                  } else {
+                      TextView title = new TextView(this);
+                      title.setText("Mapa en vivo");
+                      title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+                      title.setTextColor(ink);
+                      title.setPadding(dp(12), 0, dp(12), 0);
+                      bar.addView(title);
+                  }
+                  root.addView(bar, new LinearLayout.LayoutParams(-1, dp(52)));
+
+                  View divider = new View(this);
+                  divider.setBackgroundColor(line);
+                  root.addView(divider, new LinearLayout.LayoutParams(-1, dp(1)));
+
+                  status = new TextView(this);
+                  status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                  status.setTextColor(muted);
+                  status.setBackgroundColor(surface);
+                  status.setPadding(dp(18), dp(10), dp(18), dp(10));
+                  status.setVisibility(View.GONE);
+                  root.addView(status, new LinearLayout.LayoutParams(-1, -2));
+
+                  web = new WebView(this);
+                  web.setBackgroundColor(Color.parseColor(night ? "#0A0A0A" : "#E5E5E5"));
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setUserAgentString(s.getUserAgentString() + " Patineta/1.0");
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          ready = true;
+                          handler.removeCallbacks(refresh);
+                          handler.post(refresh);
+                      }
+
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                          String url = req.getUrl().toString();
+                          if (!"GET".equals(req.getMethod()) || !MapCache.allowed(url)) return null;
+                          String mime = MapCache.mime(url);
+                          String enc = mime.startsWith("image/") ? null : "utf-8";
+                          byte[] data = MapCache.get(getApplicationContext(), url);
+                          if (data == null) { // sin internet y sin copia guardada
+                              return new WebResourceResponse(mime, enc, 404, "Not Found",
+                                      new HashMap<String, String>(), new ByteArrayInputStream(new byte[0]));
+                          }
+                          return new WebResourceResponse(mime, enc, new ByteArrayInputStream(data));
+                      }
+                  });
+                  root.addView(web, new LinearLayout.LayoutParams(-1, 0, 1f));
+                  setContentView(root);
+
+                  String html = HTML
+                          .replace("__NIGHT__", night ? "true" : "false")
+                          .replace("__BG__", night ? "#0A0A0A" : "#E5E5E5")
+                          .replace("__CARD__", night ? "#151515" : "#FFFFFF")
+                          .replace("__INK__", night ? "#F2F2F2" : "#111111")
+                          .replace("__FILTER__", night ? "invert(1) brightness(0.95) contrast(0.9)" : "none");
+                  web.loadDataWithBaseURL("https://localhost/", html, "text/html", "utf-8", null);
+              }
+
+              private void push() {
+                  if (!ready || web == null) return;
+                  String json = Datos.rutaJson(ruta);
+                  String ref = "[]";
+                  if (live && Datos.rutaDiaria(this).exists()) ref = Datos.rutaJson(Datos.rutaDiaria(this));
+                  web.evaluateJavascript("update(" + json + "," + live + "," + ref + ");", null);
+              }
+
+              // ------------------------------------------------------------------ Guardar sin internet
+              private void onGuardar() {
+                  if (MapCache.puntos(ruta).size() < 2) {
+                      Toast.makeText(this, "Esta ruta no tiene puntos para guardar", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  if (!daily && Datos.rutaDiaria(this).exists()) {
+                      new AlertDialog.Builder(this)
+                              .setTitle("¿Reemplazar tu ruta diaria?")
+                              .setMessage("Ya tienes una ruta diaria guardada. Esta la va a reemplazar.")
+                              .setPositiveButton("Reemplazar", (d, w) -> guardar())
+                              .setNegativeButton("Cancelar", null)
+                              .show();
+                  } else {
+                      guardar();
+                  }
+              }
+
+              private void guardar() {
+                  if (!daily) Datos.copiar(ruta, Datos.rutaDiaria(this));
+                  List<double[]> pts = MapCache.puntos(Datos.rutaDiaria(this));
+                  List<String> urls = MapCache.urlsPara(pts);
+                  if (job != null) job.cancel();
+                  status.setVisibility(View.VISIBLE);
+                  status.setText("Guardando el mapa de la zona... 0 / " + urls.size()
+                          + "\nDeja esta pantalla abierta y con internet.");
+                  job = MapCache.download(getApplicationContext(), urls, new MapCache.Listener() {
+                      @Override
+                      public void onProgress(int done, int total) {
+                          status.setText("Guardando el mapa de la zona... " + done + " / " + total
+                                  + "\nDeja esta pantalla abierta y con internet.");
+                      }
+
+                      @Override
+                      public void onDone(int total, int failed) {
+                          MapCache.saveInfo(getApplicationContext());
+                          if (failed == 0) {
+                              status.setText("Listo: tu ruta diaria y su mapa ya funcionan sin internet.");
+                          } else {
+                              status.setText("Se guardó casi todo, pero faltaron " + failed
+                                      + " imágenes por falta de internet. Toca \"Descargar de nuevo\" para completar.");
+                          }
+                          if (ready) {
+                              handler.removeCallbacks(refresh);
+                              handler.post(refresh);
+                          }
+                      }
+                  });
+              }
+
+              // ------------------------------------------------------------------ Ciclo de vida
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (ready) {
+                      handler.removeCallbacks(refresh);
+                      handler.post(refresh);
+                  }
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  handler.removeCallbacks(refresh);
+              }
+
+              @Override
+              protected void onDestroy() {
+                  handler.removeCallbacks(refresh);
+                  if (job != null) job.cancel();
+                  if (web != null) {
+                      web.destroy();
+                      web = null;
+                  }
+                  super.onDestroy();
+              }
+          }
+          EOF_PATINETA
+          mkdir -p app/src/main/java/com/sebastian/patineta
+          cat > app/src/main/java/com/sebastian/patineta/MapCache.java <<'EOF_PATINETA'
+          package com.sebastian.patineta;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.os.Handler;
+          import android.os.Looper;
+
+          import java.io.BufferedReader;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.FileReader;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.security.MessageDigest;
+          import java.util.ArrayList;
+          import java.util.LinkedHashSet;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Set;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.atomic.AtomicInteger;
+
+          /**
+           * Guarda en el celular las imágenes del mapa (y los archivos de Leaflet) para poder
+           * ver el mapa sin internet. Todo lo que se ve con internet queda guardado, y además
+           * se puede descargar de una vez la zona completa de una ruta.
+           */
+          public class MapCache {
+              static final String TILE_URL = "https://a.basemaps.cartocdn.com/light_all/%d/%d/%d.png";
+              static final int ZOOM_MIN = 11;
+              static final int ZOOM_MAX = 17;
+              static final int MAX_TILES = 2500;
+
+              private static final String PREFS = "mapa";
+
+              /** Solo se guardan las direcciones del mapa y de Leaflet. */
+              static boolean allowed(String url) {
+                  return url.startsWith("https://unpkg.com/") || url.matches("^https://[a-d]\\.basemaps\\.cartocdn\\.com/.*");
+              }
+
+              private static String normalize(String url) {
+                  return url.replaceFirst("^https://[a-d]\\.basemaps\\.cartocdn\\.com/", "https://basemaps.cartocdn.com/");
+              }
+
+              private static File dir(Context c) {
+                  File d = new File(c.getFilesDir(), "mapa");
+                  if (!d.exists()) d.mkdirs();
+                  return d;
+              }
+
+              private static String hex(byte[] b) {
+                  StringBuilder sb = new StringBuilder();
+                  for (byte x : b) sb.append(String.format(Locale.US, "%02x", x));
+                  return sb.toString();
+              }
+
+              private static File fileFor(Context c, String url) {
+                  try {
+                      MessageDigest md = MessageDigest.getInstance("SHA-1");
+                      String h = hex(md.digest(normalize(url).getBytes("UTF-8")));
+                      return new File(dir(c), h);
+                  } catch (Exception e) {
+                      return new File(dir(c), Integer.toHexString(normalize(url).hashCode()));
+                  }
+              }
+
+              static boolean has(Context c, String url) {
+                  return fileFor(c, url).exists();
+              }
+
+              private static byte[] readAll(InputStream in) throws IOException {
+                  ByteArrayOutputStream out = new ByteArrayOutputStream();
+                  byte[] buf = new byte[8192];
+                  int n;
+                  while ((n = in.read(buf)) > 0) {
+                      out.write(buf, 0, n);
+                      if (out.size() > 8 * 1024 * 1024) throw new IOException("archivo muy grande");
+                  }
+                  return out.toByteArray();
+              }
+
+              /** Devuelve el archivo guardado; si no existe y hay internet, lo descarga y lo guarda. */
+              static byte[] get(Context c, String url) {
+                  File f = fileFor(c, url);
+                  try {
+                      if (f.exists()) {
+                          try (FileInputStream in = new FileInputStream(f)) {
+                              return readAll(in);
+                          }
+                      }
+                      HttpURLConnection con = (HttpURLConnection) new URL(url).openConnection();
+                      con.setConnectTimeout(10000);
+                      con.setReadTimeout(15000);
+                      con.setRequestProperty("User-Agent", "Patineta/1.0 (app personal)");
+                      if (con.getResponseCode() != 200) {
+                          con.disconnect();
+                          return null;
+                      }
+                      byte[] data;
+                      try (InputStream in = con.getInputStream()) {
+                          data = readAll(in);
+                      } finally {
+                          con.disconnect();
+                      }
+                      File tmp = new File(f.getParentFile(), f.getName() + ".tmp");
+                      try (FileOutputStream out = new FileOutputStream(tmp)) {
+                          out.write(data);
+                      }
+                      if (!tmp.renameTo(f)) tmp.delete();
+                      return data;
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              static String mime(String url) {
+                  String u = url.toLowerCase(Locale.US);
+                  int q = u.indexOf('?');
+                  if (q > 0) u = u.substring(0, q);
+                  if (u.endsWith(".js")) return "application/javascript";
+                  if (u.endsWith(".css")) return "text/css";
+                  if (u.endsWith(".png")) return "image/png";
+                  if (u.endsWith(".svg")) return "image/svg+xml";
+                  return "application/octet-stream";
+              }
+
+              // ------------------------------------------------------------------ Zona de la ruta
+              /** Puntos [lat, lon] de un archivo de ruta. */
+              static List<double[]> puntos(File f) {
+                  List<double[]> list = new ArrayList<>();
+                  if (!f.exists()) return list;
+                  try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+                      String s;
+                      while ((s = r.readLine()) != null) {
+                          int i = s.indexOf(',');
+                          if (i <= 0) continue;
+                          try {
+                              list.add(new double[]{Double.parseDouble(s.substring(0, i).trim()),
+                                      Double.parseDouble(s.substring(i + 1).trim())});
+                          } catch (NumberFormatException ignored) { }
+                      }
+                  } catch (IOException ignored) { }
+                  return list;
+              }
+
+              private static int tileX(double lon, int z) {
+                  int n = 1 << z;
+                  int x = (int) Math.floor((lon + 180.0) / 360.0 * n);
+                  return Math.max(0, Math.min(n - 1, x));
+              }
+
+              private static int tileY(double lat, int z) {
+                  int n = 1 << z;
+                  double r = Math.toRadians(Math.max(-85.0, Math.min(85.0, lat)));
+                  int y = (int) Math.floor((1.0 - Math.log(Math.tan(r) + 1.0 / Math.cos(r)) / Math.PI) / 2.0 * n);
+                  return Math.max(0, Math.min(n - 1, y));
+              }
+
+              /** Direcciones de todas las imágenes que cubren la ruta (y un margen alrededor). */
+              static List<String> urlsPara(List<double[]> pts) {
+                  for (int zmax = ZOOM_MAX; zmax >= ZOOM_MIN; zmax--) {
+                      Set<String> set = new LinkedHashSet<>();
+                      for (int z = ZOOM_MIN; z <= zmax; z++) {
+                          int n = 1 << z;
+                          for (double[] p : pts) {
+                              int cx = tileX(p[1], z), cy = tileY(p[0], z);
+                              for (int dx = -1; dx <= 1; dx++) {
+                                  for (int dy = -1; dy <= 1; dy++) {
+                                      int x = cx + dx, y = cy + dy;
+                                      if (x < 0 || y < 0 || x >= n || y >= n) continue;
+                                      set.add(String.format(Locale.US, TILE_URL, z, x, y));
+                                  }
+                              }
+                          }
+                      }
+                      if (set.size() <= MAX_TILES || zmax == ZOOM_MIN) return new ArrayList<>(set);
+                  }
+                  return new ArrayList<>();
+              }
+
+              // ------------------------------------------------------------------ Descarga
+              interface Listener {
+                  void onProgress(int done, int total);
+
+                  void onDone(int total, int failed);
+              }
+
+              static class Job {
+                  volatile boolean cancelled = false;
+
+                  void cancel() {
+                      cancelled = true;
+                  }
+              }
+
+              /** Descarga las imágenes que falten (3 a la vez). Los avisos llegan en el hilo principal. */
+              static Job download(final Context app, final List<String> urls, final Listener l) {
+                  final Job job = new Job();
+                  final Handler main = new Handler(Looper.getMainLooper());
+                  final int total = urls.size();
+                  final AtomicInteger done = new AtomicInteger(0);
+                  final AtomicInteger failed = new AtomicInteger(0);
+                  final ExecutorService ex = Executors.newFixedThreadPool(3);
+                  if (total == 0) {
+                      main.post(() -> l.onDone(0, 0));
+                      ex.shutdown();
+                      return job;
+                  }
+                  for (final String u : urls) {
+                      ex.execute(() -> {
+                          if (!job.cancelled) {
+                              if (!has(app, u) && get(app, u) == null) failed.incrementAndGet();
+                          }
+                          final int d = done.incrementAndGet();
+                          if (job.cancelled) return;
+                          if (d == total) {
+                              main.post(() -> {
+                                  if (!job.cancelled) l.onDone(total, failed.get());
+                              });
+                          } else if (d % 5 == 0) {
+                              main.post(() -> {
+                                  if (!job.cancelled) l.onProgress(d, total);
+                              });
+                          }
+                      });
+                  }
+                  ex.shutdown();
+                  return job;
+              }
+
+              // ------------------------------------------------------------------ Información
+              static String info(Context c) {
+                  return c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("info", "Mapa guardado en el celular");
+              }
+
+              static void saveInfo(Context c) {
+                  File[] fs = dir(c).listFiles();
+                  long bytes = 0;
+                  int n = 0;
+                  if (fs != null) {
+                      for (File f : fs) {
+                          if (f.getName().endsWith(".tmp")) continue;
+                          bytes += f.length();
+                          n++;
+                      }
+                  }
+                  String s = "Mapa guardado: " + n + " imágenes (" + String.format(Locale.US, "%.1f", bytes / 1048576.0) + " MB)";
+                  SharedPreferences.Editor e = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit();
+                  e.putString("info", s);
+                  e.apply();
+              }
+          }
+          EOF_PATINETA
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_fg.xml <<'EOF_PATINETA'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:strokeColor="#FFFFFF" android:strokeWidth="4"
+                  android:strokeLineCap="round" android:strokeLineJoin="round"
+                  android:pathData="M30,66L74,66" />
+              <path android:strokeColor="#FFFFFF" android:strokeWidth="4"
+                  android:strokeLineCap="round" android:strokeLineJoin="round"
+                  android:pathData="M72,66L64,36L72,36" />
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M28,74a6,6 0 1,0 12,0a6,6 0 1,0 -12,0" />
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M68,74a6,6 0 1,0 12,0a6,6 0 1,0 -12,0" />
+          </vector>
+          EOF_PATINETA
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF_PATINETA'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_bg" />
+              <foreground android:drawable="@drawable/ic_fg" />
+          </adaptive-icon>
+          EOF_PATINETA
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'EOF_PATINETA'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_bg">#111111</color>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:colorPrimary">#111111</item>
+                  <item name="android:colorPrimaryDark">#111111</item>
+                  <item name="android:colorAccent">#111111</item>
+                  <item name="android:windowBackground">@android:color/white</item>
+              </style>
+          </resources>
+          EOF_PATINETA
+          mkdir -p app/src/main/res/values-night
+          cat > app/src/main/res/values-night/themes.xml <<'EOF_PATINETA'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:colorPrimary">#F2F2F2</item>
+                  <item name="android:colorPrimaryDark">#0A0A0A</item>
+                  <item name="android:colorAccent">#F2F2F2</item>
+                  <item name="android:windowBackground">@android:color/black</item>
+              </style>
+          </resources>
+          EOF_PATINETA
+          cat > build.gradle <<'EOF_PATINETA'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF_PATINETA
+          cat > gradle.properties <<'EOF_PATINETA'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=false
+          EOF_PATINETA
+          cat > settings.gradle <<'EOF_PATINETA'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Patineta"
+          include ':app'
+          EOF_PATINETA
+          echo 'MIIKZgIBAzCCChAGCSqGSIb3DQEHAaCCCgEEggn9MIIJ+TCCBcAGCSqGSIb3DQEHAaCCBbEEggWtMIIFqTCCBaUGCyqGSIb3DQEMCgECoIIFQDCCBTwwZgYJKoZIhvcNAQUNMFkwOAYJKoZIhvcNAQUMMCsEFEPMW8WInGDDHCnZpZysi7IeUqr7AgInEAIBIDAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQGdho+xNYePxjzXjtP3t9KASCBNA9Qa7A0sZ4PVk7UBifsqIr0SWeWm+1+YcUz0KAa/y2a6IM5WWRiyBYsdbhCFmaFCpnuGv30wMpJFpehwTyf0micl497XUyoELS/YWT5lGlXM0RFkO8qFCmzs0oK2n7C8zCa4K8pfyKarKbWYNbVpWVTOruT4Be7gk56DmtHc9gdeW5HUBe7IYZS1ERuupHLj/JLM2+huWFS+2CYr6Yj8rwGwvWfHxnHoZef+Wt4ND3eKGaT+TmvHcPgRJbJyMYwW0qTEOtjbqAo8Tx8pDZVhG6n3u/3bxhgrJy2PvEPQmIhXnS/manOGkQPEvYLgLi7khxwanv4EOm55eGlaVLKcf8XpYfbcL/Th2GwB4m7cq4gg62xqQsGlh0XFWk5j3DXef/ljs/g0etJKTTYf+cXtA12XjuxKtyBZmmHsmeFEy6+JZGD99iZx0x7fOgeUFUrjJg8HQGplMbqyPhxjvwcRJjtGohigkasELhvhWmp5qDN3aHGim1V8HcWiehtY1UBNxyTHEuioCHcE6YPtcbIpzBpKI8yglwGWy753XHdeFOI5XAMWBGmg1Qc8k8nw+xFRjrhlDAQUVoBUTnSfH+4TqP38xh9ueayvf8z+2kym5WsyHcwiKfYcFd2DpA0zm8sw0rEqENF7UfCxhUWff0StM0fwCxfe3VgCFqFaYZ0+w5TuGqQEadai6HEzbvbdYuKD/K076agKNOVyqjrOsi0Dl5ZgmI4f+x4Vi6BIrtP8QYYtSgMuIr1JsutrepdXC2zRjN2UfkdP3/Imly2zugpxeh7A6YxptC1+O1SARxpre1IL30poUjecgiRQP6vbcYsD4eEqrqOKix4fIqtAgQ+WmM6RY6gHuYiA8hBhoASdc9m5rZNbpGcphQJKd2bgA01JJnHF6XudqGbKEuGC3FQsZK7PkYC4OhOTOa+rgMWW4M/zqP0EfPME7PRL5+MPivNZrvu/0IODMadjdSc2NeQJxVKCjH8/t/sGvIIy+BYCHysxNxF+1PEpCIvhHw8g7Xgkm726q+CJhE+n0GK6X22YGprbaIWg9CJVX/ARVUP8GuiVhK5RyBQRy+y5PhbnHWCSkjuZKFIPBgelqLb/RHIVjv0N1S9iVme5qwdbMuOHfMNZuxXiWOrzo27J+9qLaWFQWLVXlWkCgjTsXUgo1twMzXSr9AWu3xh9CIPvGo+frMVEYTFHnTav1E7Ceyxg7QypjN5yEcAn1Y+JL3VMJqDjVh0t8wtnCwBZcBw2eDSDg/KfMX/xoxJ37z7Qbw/NglOLXvnPBIFYEgbR6gvQjyFM1tT8fyetlCTHA7QFco1Zvg7tr3ORY46cCV7D+V2xozRwyvkDN90tpc7z7YcY2AfhGTPDIhI1IGi1NLNw3c+VQZjvlQ0+/+PiWsDy7W28Bei7zvNZpw9MTAEMGHYQqlcSGLDZQg+OlQveYjYRjhlRH2TiUr0c/U2V4A8UX4kGtuE9Dz68e6MDgtSNvzzTxkMLNYXrol5Pn7JlzJ2GbtOEusFgZyr34Rld9feHNQ7V31aPbi+GR6lypgwm6tRnSeW/TFJmExT7Wsj0nzeesnCW3PbjStK98EvDXLx7k9aC9brEJhu4IS1vYoeWUevo2KQwDoH09fMIzcksXAuCA63OxTozFSMC0GCSqGSIb3DQEJFDEgHh4AYQBuAGQAcgBvAGkAZABkAGUAYgB1AGcAawBlAHkwIQYJKoZIhvcNAQkVMRQEElRpbWUgMTc5NDk1NjY5MTg2NjCCBDEGCSqGSIb3DQEHBqCCBCIwggQeAgEAMIIEFwYJKoZIhvcNAQcBMGYGCSqGSIb3DQEFDTBZMDgGCSqGSIb3DQEFDDArBBRqpZUgo5mX+yo/xuleRtj9Ea3vUwICJxACASAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEFma7K6tkHojQDuZkJkHA1uAggOg8UTCoRE70OVUAgUN34xs1mOEAhyGmptCovApnXmmD98F3qcEl/KGFfcUHgGRyxbnynrSIsI/lZBMwRXzmjPHkze3TAtFl+ZpFe79hHZcELQmaHxof7tWN1ObFSRoxp03n384vSYBuVjv5FsYu3aYRDRduwtEKj0KLR9JG5SfCetaIkraX1TuXkTBxeOEOEwET9p3ucU19qncxjykxsaVa9GTdU537BXID/+ttzOW/ECMhpAzuiekycMdOEYMEKE3hTHQ7sQsDUA0AE4burURKxJTzzuz25xPjou8wVxmA1SQ+xrGYFmJ+Ppi1PO0m3YCcJDQyHb+IM2gQ5xwtbF4tv/rVVNhxPQzQbFJoadQJN/H9y6cWJk3UrGSXVk8cAULRe/OrrFNVHAiDYBCCN/CmRvlEG614UqXBNbzQuUrVHvSp9j1B8QHmkoSBZwvN55ML1wwXl2At1szfSE45ezHYcuVez8vRxLAlnFtjyNq2R65q+fpebUVU6PkMiMyaGjC3+TKXlKYJgB0U5e1XWukUL45wuw57bQf2wCTzWReyghTD2WcLDHFVGKCBFNRii0PkiJ7R0ZViuTcMDoCiGIkoW5A4GJ9gmWjztV0gQ728r8HlPNboEXJco5yblS4Zm7KCwTxsuwyKUK/qbLpfz7VfZFyb9+eMfZ9adfHy3jsGRyd3SvbqB62NaL/2q7hj8bypJc3sVSbHMAksSc0CmxeaztYCkOZSm0vi5ep+JorcDo52g3MccoVGfaKEwHZaADMRElbvP72d5Ghmfs56YifFfU59kFpd70qDUThBvsjYJ0wg6duZYjGRWBtLijLxpmFteofZvcKMB7WmptKY/ksHl4g0DFjkgDWeWD6GzN8HBJMLTFevg5GS/q9YeHxgC9pZArjnFbW9jP6OVUQd9/kJ824ZJo+koT7yJS7szBFCdUO2aWe9BSATDNsV6mhPk0JzhMlAkaH1b4ysar6L8QMEiMm9ebBJy4bIwkOPmMSgHuBHb8gy7XSSJVA1yaXCpTkNTJ6KaRlhKSmmlyoqAyvvwIfw0vqffw1e8TSq1T+9Xz5tIPcX3QYBB5YO7wriCncEuTMMHeff6Qs/spaWVP1VstTqhnIdcMkdNx1tw6aJY5yyHDuBo8immFIoDjdIdmyd5AdXensJRNArU51WzraqhEhHPP1ptiv6RIi7ce4DHWGLGMz0ZeTo7Kh5A5Wj6KvhVcqjM5GngQYsEqYHDDnRzBNMDEwDQYJYIZIAWUDBAIBBQAEINWclGjpkiA/gSLxE4YeEnEVGWr7aZtF/ErNvaEgCa6uBBSp0BEIZ8TveJm8fa/UsewgRXN1UwICJxA=' | base64 -d > app/debug.keystore
+
+      - name: Compilar el APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Renombrar el APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk Patineta.apk
+
+      - name: Publicar el APK para descargar
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Patineta v${{ github.run_number }}
+          body: Descarga Patineta.apk desde tu celular e instálalo.
+          files: Patineta.apk
